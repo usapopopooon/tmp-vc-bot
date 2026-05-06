@@ -67,6 +67,35 @@ def _setup_logging() -> None:
 _setup_logging()
 logger = logging.getLogger(__name__)
 
+
+def _run_migrations() -> None:
+    """Alembic マイグレーションを起動時に適用する (冪等)。
+
+    Why: Railway / Heroku / 単体 docker run など、起動経路によっては
+    Dockerfile CMD の前段が省略されることがあり、その場合
+    `relation "lobbies" does not exist` で落ちる。Python から直接
+    `alembic upgrade head` を実行することで、どの起動経路でも確実に
+    スキーマが揃った状態で Bot を起動できる。
+    """
+    try:
+        from alembic.config import Config
+
+        from alembic import command
+    except ImportError:
+        logger.warning("alembic not installed; skipping migration")
+        return
+
+    cfg_path = os.environ.get("ALEMBIC_CONFIG", "alembic.ini")
+    cfg = Config(cfg_path)
+    logger.info("Running alembic upgrade head (config: %s)", cfg_path)
+    try:
+        command.upgrade(cfg, "head")
+        logger.info("alembic upgrade head completed")
+    except Exception:
+        logger.exception("alembic upgrade head failed")
+        raise
+
+
 #: グローバル変数として Bot インスタンスを保持。
 #:
 #: シグナルハンドラから Bot にアクセスするために使用する。
@@ -106,7 +135,7 @@ async def _shutdown_bot() -> None:
 
 
 async def main() -> None:
-    """Bot のメインエントリーポイント。DB 確認 → シグナルハンドラ → Bot 起動。"""
+    """マイグレーション → DB 確認 → シグナルハンドラ → Bot 起動。"""
     global _bot
 
     # データベース接続チェック (リトライ付き)
@@ -116,6 +145,14 @@ async def main() -> None:
             "Check DATABASE_URL and ensure the database is running."
         )
         sys.exit(1)
+
+    # マイグレーション (起動経路に依存しないよう Python から実行)
+    if os.environ.get("SKIP_MIGRATIONS", "").lower() not in ("1", "true", "yes"):
+        try:
+            _run_migrations()
+        except Exception:
+            logger.error("Cannot start bot: alembic migration failed")
+            sys.exit(1)
 
     # シグナルハンドラを設定 (Unix 系 OS)
     # SIGTERM: Heroku, Docker, systemd などからのシャットダウン要求
