@@ -13,16 +13,17 @@ See Also:
     - :mod:`src.config`: 設定管理
 
 Notes:
-    起動前に以下を確認すること (デプロイ環境側で済ませる):
+    起動シーケンス:
 
-    - 環境変数 DISCORD_TOKEN が設定されている
-    - データベースが起動している
-    - **Alembic マイグレーションが実行済み**
-      (Dockerfile CMD の `alembic upgrade head &&` 前段、
-      または Procfile の `release` フェーズで実行する)
+    1. DB 接続確認 (リトライ付き)
+    2. Alembic マイグレーション (alembic upgrade head)
+    3. シグナルハンドラ登録
+    4. Bot 起動
 
     環境変数:
 
+    - DISCORD_TOKEN: Discord Bot トークン (必須)
+    - DATABASE_URL: DB 接続 URL
     - LOG_LEVEL: ログレベル (DEBUG, INFO, WARNING, ERROR, CRITICAL)。デフォルト: INFO
 """
 
@@ -33,6 +34,9 @@ import signal
 import sys
 from types import FrameType
 
+from alembic.config import Config
+
+from alembic import command
 from src.bot import EphemeralVCBot
 from src.config import settings
 from src.database.engine import check_database_connection_with_retry
@@ -91,8 +95,16 @@ async def _shutdown_bot() -> None:
         logger.info("Bot closed successfully")
 
 
+def _run_migrations() -> None:
+    """Alembic マイグレーションを起動時に適用する。"""
+    cfg = Config("alembic.ini")
+    logger.info("Running alembic upgrade head")
+    command.upgrade(cfg, "head")
+    logger.info("alembic upgrade head completed")
+
+
 async def main() -> None:
-    """Bot のメインエントリーポイント。DB 確認 → シグナルハンドラ → Bot 起動。"""
+    """Bot のメインエントリーポイント。DB → migration → シグナル → Bot 起動。"""
     global _bot
 
     # データベース接続チェック (リトライ付き)
@@ -102,6 +114,9 @@ async def main() -> None:
             "Check DATABASE_URL and ensure the database is running."
         )
         sys.exit(1)
+
+    # マイグレーション
+    _run_migrations()
 
     # シグナルハンドラを設定 (Unix 系 OS)
     for sig in (signal.SIGTERM, signal.SIGINT):
