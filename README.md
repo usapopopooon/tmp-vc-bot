@@ -52,19 +52,43 @@ docker compose --profile dev up test  # テスト
 docker compose --profile dev up lint  # lint
 ```
 
-## スラッシュコマンドが表示されない場合
+## マルチサーバー運用
+
+この bot は **複数の Discord サーバー (ギルド) で同時運用可能** に設計されています:
+
+- DB の `lobbies` / `voice_sessions` テーブルは `guild_id` をキーに持つマルチテナント構造
+- 1 サーバーにつき 1 ロビー (`/vc lobby` で作成、複数作成は自動で拒否)
+- 各サーバーごとに独立した一時 VC が作成・管理される
+
+bot 自体は 1 プロセスで全サーバーを捌くので、**インストール先のサーバーを増やすだけ** で
+追加運用ができます (再デプロイ不要)。
+
+### 招待 URL
+
+Discord Developer Portal → OAuth2 → URL Generator で以下を選択:
+
+- **Scopes**: `bot`, `applications.commands` (両方必須)
+- **Bot Permissions**: `Manage Channels`, `Move Members`, `Connect`, `Speak`,
+  `Send Messages`, `Embed Links`, `Manage Messages` (パネルのピン留めに必要)
+
+生成された URL を各サーバー管理者に共有すれば、それぞれのサーバーに追加できます。
+
+### スラッシュコマンドが表示されない場合
 
 招待直後に `/vc lobby` が出てこないときの確認順:
 
-1. **`SYNC_GUILD_ID` を設定** — 環境変数に対象サーバーの ID を入れて再起動。
+1. **`SYNC_GUILD_IDS` に対象サーバーの ID をカンマ区切りで列挙して再起動** —
    グローバル同期は Discord 側で最大 1 時間かかるが、ギルド単位は即時反映。
    ```
-   SYNC_GUILD_ID=123456789012345678
+   SYNC_GUILD_IDS=111111111111111111,222222222222222222,333333333333333333
    ```
-2. **Bot 招待 URL に `applications.commands` スコープが入っているか確認** —
-   `bot` だけだとスラッシュコマンドが登録されない。両方チェックして招待し直す。
-3. **Bot 起動ログで `Synced N slash commands` を確認** — 0 件なら Cog 読み込みに失敗している。
-4. **Discord クライアントを再読み込み** (Ctrl+R / Cmd+R) — キャッシュが残っていることがある。
+   恒久運用ではこの変数を空にしてグローバル同期 (1 度だけ全サーバーへ伝搬) でも
+   OK。新規サーバー追加のたびに即時反映したい場合だけ ID を追記する。
+2. **招待 URL に `applications.commands` スコープが入っているか確認**
+   (`bot` だけだとスラッシュコマンドが登録されない)。
+3. **Bot 起動ログで `Synced N slash commands to guild ...` を確認** —
+   0 件や同期エラーなら Cog 読み込みに失敗している。
+4. **Discord クライアントを再読み込み** (Ctrl+R / Cmd+R)。
 5. **`/vc lobby` は `default_permissions(administrator=True)`** のため、管理者
    以外には表示されない。サーバー設定 → 連携サービス → Bot からロール/チャンネル
    ごとに表示権限を上書き可能。

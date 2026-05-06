@@ -102,10 +102,13 @@ class EphemeralVCBot(commands.Bot):
                 self.add_view(view)
 
         # 3. スラッシュコマンドの同期
-        # SYNC_GUILD_ID を指定するとそのギルドへ即時同期する (グローバル同期は
-        # Discord 側で最大 1 時間の伝搬遅延があるため、初回デプロイや開発中は
-        # ギルド ID を指定するのが推奨)。カンマ区切りで複数指定も可。
-        sync_guild_ids = os.environ.get("SYNC_GUILD_ID", "").strip()
+        # SYNC_GUILD_IDS にカンマ区切りでギルド ID を列挙すると、それぞれへ
+        # 即時同期する (グローバル同期は Discord 側で最大 1 時間の伝搬遅延が
+        # あるため、初回デプロイや開発中はギルド ID を指定するのが推奨)。
+        # SYNC_GUILD_ID (単数形) も後方互換として受け付ける。
+        sync_guild_ids = (
+            os.environ.get("SYNC_GUILD_IDS") or os.environ.get("SYNC_GUILD_ID") or ""
+        ).strip()
         try:
             if sync_guild_ids:
                 for raw in sync_guild_ids.split(","):
