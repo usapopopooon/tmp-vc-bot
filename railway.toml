@@ -7,4 +7,7 @@ numReplicas = 1
 sleepApplication = false
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
-startCommand = "alembic upgrade head && python -m src.main"
+# startCommand は意図的に未設定。
+# Railway の startCommand は `&&` をシェル解釈せず、第 1 トークンしか
+# 実行しないことがあるため、Dockerfile の CMD (明示的に sh -c を使用)
+# に起動を委譲する。

@@ -59,7 +59,6 @@ class EphemeralVCBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         """Bot 起動前に呼ばれるフック。Cog・View の初期化を行う。"""
-        logger.info("setup_hook: starting")
         # 1. Cog の読み込み
         extensions = [
             "src.cogs.voice",
@@ -134,11 +133,9 @@ class EphemeralVCBot(commands.Bot):
             logger.exception("Failed to sync slash commands: %s", e)
             raise
 
-        logger.info("setup_hook: done — connecting to Discord gateway...")
-
     async def on_ready(self) -> None:
         """Bot が Discord に接続完了したときに呼ばれる。"""
-        # 明示的に online 化 (再接続時にプレゼンスが落ちる場合への保険)
+        # 再接続時にプレゼンスが落ちる場合に備えて再設定
         try:
             await self.change_presence(
                 status=discord.Status.online,
@@ -148,11 +145,5 @@ class EphemeralVCBot(commands.Bot):
             logger.warning("Failed to change_presence in on_ready: %s", e)
 
         if self.user:
-            logger.info(
-                "Bot is ONLINE — logged in as %s (ID: %s, guilds: %d)",
-                self.user,
-                self.user.id,
-                len(self.guilds),
-            )
-            print(f"Logged in as {self.user} (ID: {self.user.id})", flush=True)
-        print("------", flush=True)
+            print(f"Logged in as {self.user} (ID: {self.user.id})")
+        print("------")

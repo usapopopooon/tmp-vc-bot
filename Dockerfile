@@ -16,5 +16,11 @@ COPY src/ src/
 COPY alembic/ alembic/
 COPY alembic.ini .
 
-# Default: run migrations, then start bot
-CMD ["sh", "-c", "alembic upgrade head && python -m src.main"]
+# Default: run migrations, then start bot.
+# echo マーカーで「どの段階まで進んだか」をシェルレベルで残す
+# (Python の logging やバッファリングに左右されない)。
+CMD ["sh", "-c", "echo '>>> CMD: container start' && \
+echo '>>> CMD: running alembic upgrade head' && \
+alembic upgrade head && \
+echo '>>> CMD: alembic done; launching python -m src.main' && \
+exec python -m src.main"]
