@@ -21,7 +21,7 @@ test: setup
 
 lint: setup
 	$(VENV)/bin/ruff check src tests
-	$(VENV)/bin/ruff format --check src tests
+	$(VENV)/bin/ruff format --check .
 
 typecheck: setup
 	$(VENV)/bin/mypy src
@@ -58,7 +58,7 @@ ci: setup
 	@echo "=== YAML Lint ==="
 	yamllint -s .
 	@echo "=== Ruff Format ==="
-	$(VENV)/bin/ruff format --check src tests
+	$(VENV)/bin/ruff format --check .
 	@echo "=== Ruff Lint ==="
 	$(VENV)/bin/ruff check src tests
 	@echo "=== Type Check ==="

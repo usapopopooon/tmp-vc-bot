@@ -96,9 +96,7 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
-        sa.UniqueConstraint(
-            "voice_session_id", "user_id", name="uq_session_user"
-        ),
+        sa.UniqueConstraint("voice_session_id", "user_id", name="uq_session_user"),
     )
     op.create_index(
         "ix_voice_session_members_user_id",
