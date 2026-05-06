@@ -52,6 +52,23 @@ docker compose --profile dev up test  # テスト
 docker compose --profile dev up lint  # lint
 ```
 
+## スラッシュコマンドが表示されない場合
+
+招待直後に `/vc lobby` が出てこないときの確認順:
+
+1. **`SYNC_GUILD_ID` を設定** — 環境変数に対象サーバーの ID を入れて再起動。
+   グローバル同期は Discord 側で最大 1 時間かかるが、ギルド単位は即時反映。
+   ```
+   SYNC_GUILD_ID=123456789012345678
+   ```
+2. **Bot 招待 URL に `applications.commands` スコープが入っているか確認** —
+   `bot` だけだとスラッシュコマンドが登録されない。両方チェックして招待し直す。
+3. **Bot 起動ログで `Synced N slash commands` を確認** — 0 件なら Cog 読み込みに失敗している。
+4. **Discord クライアントを再読み込み** (Ctrl+R / Cmd+R) — キャッシュが残っていることがある。
+5. **`/vc lobby` は `default_permissions(administrator=True)`** のため、管理者
+   以外には表示されない。サーバー設定 → 連携サービス → Bot からロール/チャンネル
+   ごとに表示権限を上書き可能。
+
 ## デプロイ
 
 ### Railway

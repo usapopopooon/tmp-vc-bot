@@ -15,6 +15,7 @@ Examples:
 """
 
 import logging
+import os
 
 import discord
 from discord.ext import commands
@@ -101,9 +102,29 @@ class EphemeralVCBot(commands.Bot):
                 self.add_view(view)
 
         # 3. スラッシュコマンドの同期
+        # SYNC_GUILD_ID を指定するとそのギルドへ即時同期する (グローバル同期は
+        # Discord 側で最大 1 時間の伝搬遅延があるため、初回デプロイや開発中は
+        # ギルド ID を指定するのが推奨)。カンマ区切りで複数指定も可。
+        sync_guild_ids = os.environ.get("SYNC_GUILD_ID", "").strip()
         try:
-            synced = await self.tree.sync()
-            logger.info("Synced %d slash commands", len(synced))
+            if sync_guild_ids:
+                for raw in sync_guild_ids.split(","):
+                    gid = raw.strip()
+                    if not gid:
+                        continue
+                    guild = discord.Object(id=int(gid))
+                    self.tree.copy_global_to(guild=guild)
+                    synced = await self.tree.sync(guild=guild)
+                    logger.info(
+                        "Synced %d slash commands to guild %s", len(synced), gid
+                    )
+            else:
+                synced = await self.tree.sync()
+                logger.info(
+                    "Synced %d slash commands globally "
+                    "(may take up to 1 hour to propagate)",
+                    len(synced),
+                )
         except discord.HTTPException as e:
             logger.exception("Failed to sync slash commands: %s", e)
             raise
