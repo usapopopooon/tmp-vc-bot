@@ -61,6 +61,9 @@ def _setup_logging() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         # Docker/systemd 環境では stdout に出力
         stream=sys.stdout,
+        # force=True: 既に basicConfig されていても上書きする (alembic などが
+        # logging.config.fileConfig で先にハンドラを張ってしまうケースへの保険)
+        force=True,
     )
 
 
@@ -138,6 +141,8 @@ async def main() -> None:
     """マイグレーション → DB 確認 → シグナルハンドラ → Bot 起動。"""
     global _bot
 
+    print(">>> main() entered", flush=True)
+
     # データベース接続チェック (リトライ付き)
     if not await check_database_connection_with_retry():
         logger.error(
@@ -145,6 +150,7 @@ async def main() -> None:
             "Check DATABASE_URL and ensure the database is running."
         )
         sys.exit(1)
+    print(">>> DB connection OK", flush=True)
 
     # マイグレーション (起動経路に依存しないよう Python から実行)
     if os.environ.get("SKIP_MIGRATIONS", "").lower() not in ("1", "true", "yes"):
@@ -153,6 +159,9 @@ async def main() -> None:
         except Exception:
             logger.error("Cannot start bot: alembic migration failed")
             sys.exit(1)
+        print(">>> migrations OK", flush=True)
+    else:
+        print(">>> migrations SKIPPED", flush=True)
 
     # シグナルハンドラを設定 (Unix 系 OS)
     # SIGTERM: Heroku, Docker, systemd などからのシャットダウン要求
@@ -187,9 +196,19 @@ async def main() -> None:
         except (ValueError, OSError) as e:
             logger.warning("Could not register SIGPIPE handler: %s", e)
 
+    print(">>> creating bot", flush=True)
     _bot = EphemeralVCBot()
-    async with _bot:
-        await _bot.start(settings.discord_token)
+    print(">>> bot.start() — connecting to Discord gateway", flush=True)
+    try:
+        async with _bot:
+            await _bot.start(settings.discord_token)
+    except Exception:
+        # ロガー設定が壊れていても見えるよう、素の traceback も出す
+        import traceback
+
+        print(">>> bot.start() raised:", flush=True)
+        traceback.print_exc()
+        raise
 
 
 if __name__ == "__main__":

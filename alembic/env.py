@@ -11,7 +11,10 @@ from src.database.models import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False: Bot プロセス内から alembic を呼ぶと、
+    # デフォルトの True ではアプリ側の root logger が無効化され、以降の
+    # logger.info/error がすべて黙殺されてしまう。
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # 環境変数 DATABASE_URL があれば alembic.ini の設定を上書き
 database_url = os.environ.get("DATABASE_URL")
