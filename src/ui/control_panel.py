@@ -413,6 +413,22 @@ class UserLimitModal(discord.ui.Modal, title="人数制限変更"):
         channel = interaction.channel
         if isinstance(channel, discord.VoiceChannel):
             await interaction.response.defer()
+            # 人数制限を引き下げて超過状態になった場合、新参者から遡及的にキック
+            if new_limit > 0:
+                client = interaction.client
+                cog = (
+                    client.get_cog("VoiceCog")
+                    if isinstance(client, commands.Bot)
+                    else None
+                )
+                if cog is not None:
+                    try:
+                        await cog.enforce_all_members(channel)  # type: ignore[attr-defined]
+                    except Exception:
+                        logger.exception(
+                            "Failed to enforce user_limit on channel %s",
+                            channel.id,
+                        )
             await channel.send(f"👥 人数制限が **{limit_text}** に変更されました。")
             await refresh_panel_embed(channel)
         else:
@@ -1223,6 +1239,24 @@ class ControlPanelView(discord.ui.View):
                     embed = create_control_panel_embed(voice_session, owner)
                 else:
                     embed = None
+
+            # ロック ON 時、現在チャンネル内にいる非許可メンバーを遡及的にキック
+            # (例: モデレーター権限で connect=False を突破して滞在しているメンバー)。
+            if new_locked_state:
+                client = interaction.client
+                cog = (
+                    client.get_cog("VoiceCog")
+                    if isinstance(client, commands.Bot)
+                    else None
+                )
+                if cog is not None:
+                    try:
+                        await cog.enforce_all_members(channel)  # type: ignore[attr-defined]
+                    except Exception:
+                        logger.exception(
+                            "Failed to enforce restrictions on lock for channel %s",
+                            channel.id,
+                        )
 
             status = "ロック" if new_locked_state else "ロック解除"
             emoji = "🔒" if new_locked_state else "🔓"

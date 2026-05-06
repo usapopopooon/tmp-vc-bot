@@ -349,15 +349,113 @@ class VoiceCog(commands.Cog):
     # 入室制限の強制
     # ==========================================================================
 
+    def _evaluate_member_restriction(
+        self,
+        member: discord.Member,
+        channel: discord.VoiceChannel,
+        voice_session: VoiceSession,
+        *,
+        current_count: int | None = None,
+    ) -> str | None:
+        """メンバーが一時 VC の制限に違反しているかを判定する。
+
+        判定ルール:
+          - Bot / Administrator / オーナーは常に許可
+          - 個別の connect=False overwrite (ブロック) があればキック
+          - ロック中: 個別の connect=True がなければキック
+          - 人数制限超過: overwrite に関係なく超過分はキック
+
+        Args:
+            member: 判定対象のメンバー
+            channel: 対象の VC
+            voice_session: 対応する VoiceSession
+            current_count: 現在の人数 (省略時は channel.members から計算)
+
+        Returns:
+            違反している場合はキック理由の文字列、許可される場合は None。
+        """
+        if member.bot:
+            return None
+        if member.guild_permissions.administrator:
+            return None
+        if str(member.id) == voice_session.owner_id:
+            return None
+
+        overwrites = channel.overwrites_for(member)
+
+        # --- ブロック (個別 connect=False) チェック ---
+        # 「メンバーを移動」権限を持つモデレーターが
+        # ブロックされたユーザーを VC に放り込んだ場合に弾く。
+        if overwrites.connect is False:
+            return "ブロックされているため"
+
+        # --- ロックチェック ---
+        if voice_session.is_locked and overwrites.connect is not True:
+            return "ロックされているため"
+
+        # --- 人数制限チェック ---
+        # 「メンバーを移動」権限による Discord の user_limit バイパスを
+        # Bot 側で強制する。overwrite に関わらず超過分はキックする。
+        if voice_session.user_limit > 0:
+            count = (
+                current_count
+                if current_count is not None
+                else len([m for m in channel.members if not m.bot])
+            )
+            if count > voice_session.user_limit:
+                return "人数制限を超えているため"
+
+        return None
+
+    async def _kick_with_notification(
+        self, member: discord.Member, channel: discord.VoiceChannel, reason: str
+    ) -> bool:
+        """メンバーをキックして本人とチャンネルに通知する。
+
+        Returns:
+            キックの move_to に成功したら True、失敗 (例: 権限不足) は False。
+            通知失敗は戻り値に影響しない。
+        """
+        logger.info(
+            "Kicking member %s from channel %s: %s",
+            member.id,
+            channel.id,
+            reason,
+        )
+        moved = True
+        try:
+            await member.move_to(None)
+        except discord.HTTPException as e:
+            logger.warning(
+                "Failed to kick member %s from channel %s: %s",
+                member.id,
+                channel.id,
+                e,
+            )
+            moved = False
+
+        # 通知は move_to の成否に関わらず送信する (既存挙動を維持)。
+        try:
+            await channel.send(f"⚠️ {member.mention} は{reason}入室できません。")
+        except discord.HTTPException as e:
+            logger.debug(
+                "Failed to send kick notification to channel %s: %s",
+                channel.id,
+                e,
+            )
+        with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+            await member.send(f"⚠️ **{channel.name}** は{reason}入室できませんでした。")
+        return moved
+
     async def _enforce_channel_restrictions(
         self, member: discord.Member, channel: discord.VoiceChannel
     ) -> bool:
-        """一時 VC のロック/人数制限を強制する。
+        """一時 VC のブロック/ロック/人数制限を入室時に強制する。
 
         「メンバーを移動」権限を持つユーザーは Discord の仕様上、
-        connect=False のチャンネルにも入室できてしまう。
-        このメソッドでは、Administrator 権限を持たないユーザーが
-        制限を回避して入室した場合にキックする。
+        connect=False のチャンネルや user_limit に達したチャンネルにも
+        入室できてしまう。このメソッドでは Administrator 権限を持たない
+        ユーザーが制限を回避して入室した場合にキックする。
 
         Args:
             member: 参加したメンバー
@@ -367,11 +465,9 @@ class VoiceCog(commands.Cog):
             True: キックした (呼び出し元で後続処理をスキップすべき)
             False: キックしなかった (正常な入室)
         """
-        # Bot 自身は除外
+        # DB アクセス前に早期 return (Bot / Administrator は常に許可)。
         if member.bot:
             return False
-
-        # Administrator 権限を持つユーザーは制限なし
         if member.guild_permissions.administrator:
             return False
 
@@ -381,78 +477,109 @@ class VoiceCog(commands.Cog):
                 # 一時 VC ではない (ロビーなど)
                 return False
 
-            # オーナーは制限なし
-            if str(member.id) == voice_session.owner_id:
+            reason = self._evaluate_member_restriction(member, channel, voice_session)
+            if not reason:
+                # 制限違反なし。隠しチャンネルなら閲覧権限を付与しておく
+                # (Bug D: 退出後も非表示のままにならないようにする)。
+                await self._grant_view_if_hidden(member, channel, voice_session)
                 return False
 
-            should_kick = False
-            reason = ""
-
-            # --- ロックチェック ---
-            if voice_session.is_locked:
-                # チャンネル権限で明示的に connect=True が設定されているか確認
-                overwrites = channel.overwrites_for(member)
-                if overwrites.connect is not True:
-                    # 許可されていない → キック
-                    should_kick = True
-                    reason = "ロックされているため"
-
-            # --- 人数制限チェック ---
-            # ロックで既にキック対象なら重複チェック不要
-            if not should_kick and voice_session.user_limit > 0:
-                # 現在の人数 (参加者本人を含む)
-                current_count = len([m for m in channel.members if not m.bot])
-                if current_count > voice_session.user_limit:
-                    # チャンネル権限で明示的に connect=True が設定されているか確認
-                    overwrites = channel.overwrites_for(member)
-                    if overwrites.connect is not True:
-                        should_kick = True
-                        reason = "人数制限を超えているため"
-
-            if should_kick:
-                # 重複排除テーブルで重複防止 (マルチインスタンス)
-                bucket = int(time.time()) // 5
-                event_key = f"vc_kick:{channel.id}:{member.id}:{bucket}"
-                if not await claim_event(session, event_key):
-                    logger.info(
-                        "VC kick already claimed by another instance: %s",
-                        event_key,
-                    )
-                    return False
-
+            # 重複排除テーブルで重複防止 (マルチインスタンス)
+            bucket = int(time.time()) // 5
+            event_key = f"vc_kick:{channel.id}:{member.id}:{bucket}"
+            if not await claim_event(session, event_key):
                 logger.info(
-                    "Kicking member %s from channel %s: %s",
-                    member.id,
-                    channel.id,
-                    reason,
+                    "VC kick already claimed by another instance: %s",
+                    event_key,
                 )
-                # キック実行
-                try:
-                    await member.move_to(None)
-                except discord.HTTPException as e:
-                    logger.warning(
-                        "Failed to kick member %s from channel %s: %s",
-                        member.id,
-                        channel.id,
-                        e,
-                    )
-                # チャンネルに通知
-                try:
-                    await channel.send(f"⚠️ {member.mention} は{reason}入室できません。")
-                except discord.HTTPException as e:
-                    logger.debug(
-                        "Failed to send kick notification to channel %s: %s",
-                        channel.id,
-                        e,
-                    )
-                # DM で本人に通知 (失敗しても問題ない)
-                with contextlib.suppress(discord.HTTPException, discord.Forbidden):
-                    await member.send(
-                        f"⚠️ **{channel.name}** は{reason}入室できませんでした。"
-                    )
-                return True
+                return False
 
-        return False
+        await self._kick_with_notification(member, channel, reason)
+        return True
+
+    async def _grant_view_if_hidden(
+        self,
+        member: discord.Member,
+        channel: discord.VoiceChannel,
+        voice_session: VoiceSession,
+    ) -> None:
+        """非表示チャンネルに参加したメンバーに閲覧権限を付与する。
+
+        非表示モード時、参加したメンバーは VC 中はチャンネルが見える状態だが、
+        個別 overwrite が無いと退出後に再度見えなくなる。在室中・以降の
+        UX 一貫性のため、入室時に view_channel=True を設定する。
+        """
+        if not voice_session.is_hidden:
+            return
+        overwrites = channel.overwrites_for(member)
+        if overwrites.view_channel is True:
+            return
+        try:
+            await channel.set_permissions(member, view_channel=True)
+        except discord.HTTPException as e:
+            logger.warning(
+                "Failed to grant view_channel to %s on hidden channel %s: %s",
+                member.id,
+                channel.id,
+                e,
+            )
+
+    async def enforce_all_members(self, channel: discord.VoiceChannel) -> int:
+        """チャンネル内の既存メンバー全員に制限を適用する (遡及キック)。
+
+        ロックの ON 切替時や人数制限の引き下げ時に呼び出す。
+        - ブロック/ロック違反は無条件にキック
+        - 人数制限超過は新しい参加者から順にキック (オーナー/Admin は保護)
+
+        Args:
+            channel: 対象の VC
+
+        Returns:
+            キックしたメンバー数
+        """
+        async with async_session() as session:
+            voice_session = await get_voice_session(session, str(channel.id))
+            if not voice_session:
+                return 0
+
+        kicked = 0
+
+        # --- パス 1: ブロック / ロック違反 ---
+        # 人数制限はあとで別途処理するため、ここでは current_count=0 を渡して
+        # user_limit 判定をスキップさせる (limit > 0 でも 0 > limit にならない)。
+        for member in list(channel.members):
+            reason = self._evaluate_member_restriction(
+                member, channel, voice_session, current_count=0
+            )
+            if (
+                reason
+                and reason != "人数制限を超えているため"
+                and await self._kick_with_notification(member, channel, reason)
+            ):
+                kicked += 1
+
+        # --- パス 2: 人数制限の超過分を新参者からキック ---
+        if voice_session.user_limit > 0:
+            remaining = [m for m in channel.members if not m.bot]
+            excess = len(remaining) - voice_session.user_limit
+            if excess > 0:
+                kickable = [
+                    m
+                    for m in remaining
+                    if str(m.id) != voice_session.owner_id
+                    and not m.guild_permissions.administrator
+                ]
+                # 参加時刻が新しい順 (= 後から入った人) を先にキック。
+                # 記録のないメンバーは最古扱い (0.0) とし、保護されやすくする。
+                join_times = self._join_times.get(channel.id, {})
+                kickable.sort(key=lambda m: join_times.get(m.id, 0.0), reverse=True)
+                for member in kickable[:excess]:
+                    if await self._kick_with_notification(
+                        member, channel, "人数制限を超えているため"
+                    ):
+                        kicked += 1
+
+        return kicked
 
     # ==========================================================================
     # ロビー参加処理
