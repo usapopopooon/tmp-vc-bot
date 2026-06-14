@@ -95,7 +95,6 @@ def _make_voice_session(
     vs.channel_id = channel_id
     vs.owner_id = owner_id
     vs.name = "Test channel"
-    vs.user_limit = 0
     vs.is_locked = is_locked
     vs.is_hidden = is_hidden
     return vs
@@ -2187,6 +2186,7 @@ class TestEnforceChannelRestrictions:
         m1 = _make_member(1)
         m2 = _make_member(2)
         channel = _make_channel(100, [m1, m2, member])
+        channel.user_limit = 2
         channel.name = "Test Channel"
         channel.send = AsyncMock()
         overwrites = MagicMock()
@@ -2194,7 +2194,6 @@ class TestEnforceChannelRestrictions:
         channel.overwrites_for = MagicMock(return_value=overwrites)
 
         voice_session = _make_voice_session(channel_id="100", owner_id="1")
-        voice_session.user_limit = 2
 
         mock_factory, _ = _mock_async_session()
         with (
@@ -2228,6 +2227,7 @@ class TestEnforceChannelRestrictions:
         m1 = _make_member(1)
         m2 = _make_member(2)
         channel = _make_channel(100, [m1, m2, member])
+        channel.user_limit = 2
         channel.name = "Test Channel"
         channel.send = AsyncMock()
         # connect=True が設定されているが、人数制限は越えられない
@@ -2236,7 +2236,6 @@ class TestEnforceChannelRestrictions:
         channel.overwrites_for = MagicMock(return_value=overwrites)
 
         voice_session = _make_voice_session(channel_id="100", owner_id="1")
-        voice_session.user_limit = 2
 
         mock_factory, _ = _mock_async_session()
         with (
@@ -2667,6 +2666,7 @@ class TestVoiceCogWithParametrize:
         # member_count 人いる状態 (new_member を含む)
         members = [_make_member(i) for i in range(member_count - 1)] + [new_member]
         channel = _make_channel(100, members)
+        channel.user_limit = user_limit
         channel.name = "Test Channel"
         channel.send = AsyncMock()
         overwrites = MagicMock()
@@ -2674,7 +2674,6 @@ class TestVoiceCogWithParametrize:
         channel.overwrites_for = MagicMock(return_value=overwrites)
 
         voice_session = _make_voice_session(channel_id="100", owner_id="1")
-        voice_session.user_limit = user_limit
 
         mock_factory, _ = _mock_async_session()
         with (
@@ -2688,6 +2687,81 @@ class TestVoiceCogWithParametrize:
             result = await cog._enforce_channel_restrictions(new_member, channel)
 
         assert result is should_kick
+
+    async def test_user_limit_enforcement_uses_channel_limit(self) -> None:
+        """人数制限判定は実チャンネルの user_limit を使う。"""
+        cog = _make_cog()
+        new_member = _make_member(99)
+        new_member.guild_permissions = MagicMock()
+        new_member.guild_permissions.administrator = False
+        new_member.move_to = AsyncMock()
+        new_member.send = AsyncMock()
+
+        members = [_make_member(1), _make_member(2), new_member]
+        channel = _make_channel(100, members)
+        channel.user_limit = 2
+        channel.name = "Test Channel"
+        channel.send = AsyncMock()
+        overwrites = MagicMock()
+        overwrites.connect = None
+        channel.overwrites_for = MagicMock(return_value=overwrites)
+
+        voice_session = _make_voice_session(channel_id="100", owner_id="1")
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            result = await cog._enforce_channel_restrictions(new_member, channel)
+
+        assert result is True
+        new_member.move_to.assert_awaited_once_with(None)
+
+    async def test_user_limit_counts_bot_members_as_occupied_slots(self) -> None:
+        """Discord の user_limit と同じく Bot も人数枠として数える。"""
+        cog = _make_cog()
+        new_member = _make_member(4)
+        new_member.guild_permissions = MagicMock()
+        new_member.guild_permissions.administrator = False
+        new_member.move_to = AsyncMock()
+        new_member.send = AsyncMock()
+
+        bot_member = _make_member(999, bot=True)
+        members = [
+            bot_member,
+            _make_member(1),
+            _make_member(2),
+            _make_member(3),
+            new_member,
+        ]
+        channel = _make_channel(100, members)
+        channel.user_limit = 4
+        channel.name = "Test Channel"
+        channel.send = AsyncMock()
+        overwrites = MagicMock()
+        overwrites.connect = None
+        channel.overwrites_for = MagicMock(return_value=overwrites)
+
+        voice_session = _make_voice_session(channel_id="100", owner_id="1")
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            result = await cog._enforce_channel_restrictions(new_member, channel)
+
+        assert result is True
+        new_member.move_to.assert_awaited_once_with(None)
 
     @pytest.mark.parametrize(
         "is_locked,has_connect_permission,should_kick",
@@ -2786,7 +2860,7 @@ class TestVoiceCogWithParametrize:
         [0, 1, 5, 10, 99],
     )
     async def test_lobby_default_user_limit(self, default_user_limit: int) -> None:
-        """ロビーのデフォルト人数制限がセッションに反映される。"""
+        """ロビーのデフォルト人数制限が作成するVCに反映される。"""
         cog = _make_cog()
         member = _make_member(1)
         channel = _make_channel(100)
@@ -2839,7 +2913,11 @@ class TestVoiceCogWithParametrize:
             await cog._handle_lobby_join(member, channel)
 
             mock_create.assert_awaited_once()
-            assert mock_create.call_args[1]["user_limit"] == default_user_limit
+            assert "user_limit" not in mock_create.call_args[1]
+            assert (
+                guild.create_voice_channel.call_args[1]["user_limit"]
+                == default_user_limit
+            )
 
     @pytest.mark.parametrize(
         "channel_type,expected_handled",
@@ -3168,7 +3246,6 @@ class TestVcCreateCooldownIntegration:
         mock_vs.id = 1
         mock_vs.is_locked = False
         mock_vs.is_hidden = False
-        mock_vs.user_limit = 0
         mock_create_session.return_value = mock_vs
 
         cog = _make_cog()
@@ -3284,7 +3361,6 @@ class TestVcCreateLockCooldownIntegration:
         mock_vs.id = 1
         mock_vs.is_locked = False
         mock_vs.is_hidden = False
-        mock_vs.user_limit = 0
         mock_create_session.return_value = mock_vs
 
         cog = _make_cog()
@@ -4458,6 +4534,7 @@ class TestEnforceAllMembers:
         new_member.send = AsyncMock()
 
         channel = _make_channel(100, [owner, old_member, new_member])
+        channel.user_limit = 2
         channel.name = "Test Channel"
         channel.send = AsyncMock()
 
@@ -4470,7 +4547,142 @@ class TestEnforceAllMembers:
         cog._join_times[100] = {1: 10.0, 2: 20.0, 3: 30.0}
 
         voice_session = _make_voice_session(channel_id="100", owner_id="1")
-        voice_session.user_limit = 2  # 3人 → 2人に絞る
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            kicked = await cog.enforce_all_members(channel)
+
+        assert kicked == 1
+        new_member.move_to.assert_awaited_once_with(None)
+        old_member.move_to.assert_not_called()
+
+    async def test_enforce_all_members_uses_channel_user_limit(self) -> None:
+        """遡及キックでも実チャンネルの user_limit を使う。"""
+        cog = _make_cog()
+        owner = _make_member(1)
+        owner.guild_permissions = MagicMock()
+        owner.guild_permissions.administrator = False
+        old_member = _make_member(2)
+        old_member.guild_permissions = MagicMock()
+        old_member.guild_permissions.administrator = False
+        old_member.move_to = AsyncMock()
+        old_member.send = AsyncMock()
+        new_member = _make_member(3)
+        new_member.guild_permissions = MagicMock()
+        new_member.guild_permissions.administrator = False
+        new_member.move_to = AsyncMock()
+        new_member.send = AsyncMock()
+
+        channel = _make_channel(100, [owner, old_member, new_member])
+        channel.user_limit = 2
+        channel.name = "Test Channel"
+        channel.send = AsyncMock()
+
+        ow = MagicMock()
+        ow.connect = None
+        channel.overwrites_for = MagicMock(return_value=ow)
+
+        cog._join_times[100] = {1: 10.0, 2: 20.0, 3: 30.0}
+
+        voice_session = _make_voice_session(channel_id="100", owner_id="1")
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            kicked = await cog.enforce_all_members(channel)
+
+        assert kicked == 1
+        new_member.move_to.assert_awaited_once_with(None)
+        old_member.move_to.assert_not_called()
+
+    async def test_enforce_all_members_user_limit_override_wins(self) -> None:
+        """パネル変更直後の遡及キックは明示された新しい制限値を使う。"""
+        cog = _make_cog()
+        owner = _make_member(1)
+        owner.guild_permissions = MagicMock()
+        owner.guild_permissions.administrator = False
+        old_member = _make_member(2)
+        old_member.guild_permissions = MagicMock()
+        old_member.guild_permissions.administrator = False
+        old_member.move_to = AsyncMock()
+        old_member.send = AsyncMock()
+        new_member = _make_member(3)
+        new_member.guild_permissions = MagicMock()
+        new_member.guild_permissions.administrator = False
+        new_member.move_to = AsyncMock()
+        new_member.send = AsyncMock()
+
+        channel = _make_channel(100, [owner, old_member, new_member])
+        channel.user_limit = 99  # Discord.py のローカルキャッシュが古いケース
+        channel.name = "Test Channel"
+        channel.send = AsyncMock()
+
+        ow = MagicMock()
+        ow.connect = None
+        channel.overwrites_for = MagicMock(return_value=ow)
+
+        cog._join_times[100] = {1: 10.0, 2: 20.0, 3: 30.0}
+
+        voice_session = _make_voice_session(channel_id="100", owner_id="1")
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            kicked = await cog.enforce_all_members(channel, user_limit_override=2)
+
+        assert kicked == 1
+        new_member.move_to.assert_awaited_once_with(None)
+        old_member.move_to.assert_not_called()
+
+    async def test_enforce_all_members_counts_bots_for_user_limit(self) -> None:
+        """遡及キック時も Bot を人数枠として数え、キック候補からは除外する。"""
+        cog = _make_cog()
+        owner = _make_member(1)
+        owner.guild_permissions = MagicMock()
+        owner.guild_permissions.administrator = False
+        old_member = _make_member(2)
+        old_member.guild_permissions = MagicMock()
+        old_member.guild_permissions.administrator = False
+        old_member.move_to = AsyncMock()
+        old_member.send = AsyncMock()
+        new_member = _make_member(3)
+        new_member.guild_permissions = MagicMock()
+        new_member.guild_permissions.administrator = False
+        new_member.move_to = AsyncMock()
+        new_member.send = AsyncMock()
+        bot_member = _make_member(999, bot=True)
+
+        channel = _make_channel(100, [bot_member, owner, old_member, new_member])
+        channel.user_limit = 3
+        channel.name = "Test Channel"
+        channel.send = AsyncMock()
+
+        ow = MagicMock()
+        ow.connect = None
+        channel.overwrites_for = MagicMock(return_value=ow)
+
+        cog._join_times[100] = {1: 10.0, 2: 20.0, 3: 30.0}
+
+        voice_session = _make_voice_session(channel_id="100", owner_id="1")
 
         mock_factory, _ = _mock_async_session()
         with (
@@ -4504,6 +4716,7 @@ class TestEnforceAllMembers:
         regular.send = AsyncMock()
 
         channel = _make_channel(100, [owner, admin, regular])
+        channel.user_limit = 1
         channel.name = "Test Channel"
         channel.send = AsyncMock()
 
@@ -4515,7 +4728,6 @@ class TestEnforceAllMembers:
         cog._join_times[100] = {1: 30.0, 2: 25.0, 3: 10.0}
 
         voice_session = _make_voice_session(channel_id="100", owner_id="1")
-        voice_session.user_limit = 1  # 3人 → 1人
 
         mock_factory, _ = _mock_async_session()
         with (

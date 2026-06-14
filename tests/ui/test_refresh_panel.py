@@ -21,7 +21,6 @@ def _make_voice_session(
     vs.owner_id = owner_id
     vs.is_locked = is_locked
     vs.is_hidden = is_hidden
-    vs.user_limit = 0
     vs.name = "Test"
     return vs
 
@@ -38,6 +37,7 @@ def _make_channel(*, owner: MagicMock | None = None) -> MagicMock:
     channel = MagicMock(spec=discord.VoiceChannel)
     channel.id = 100
     channel.nsfw = False
+    channel.user_limit = 0
     channel.guild = MagicMock(spec=discord.Guild)
     if owner:
         channel.guild.get_member = MagicMock(return_value=owner)
@@ -56,6 +56,7 @@ class TestRefreshPanelEmbed:
         owner = MagicMock(spec=discord.Member)
         owner.mention = "<@1>"
         channel = _make_channel(owner=owner)
+        channel.user_limit = 7
         voice_session = _make_voice_session()
 
         # パネルメッセージのモック
@@ -82,6 +83,39 @@ class TestRefreshPanelEmbed:
             call_kwargs = panel_msg.edit.call_args[1]
             assert "embed" in call_kwargs
             assert "view" in call_kwargs
+            assert "7" in [field.value for field in call_kwargs["embed"].fields]
+
+    async def test_user_limit_override_wins(self) -> None:
+        """明示された人数制限が古い channel.user_limit より優先される。"""
+        owner = MagicMock(spec=discord.Member)
+        owner.mention = "<@1>"
+        channel = _make_channel(owner=owner)
+        channel.user_limit = 99
+        voice_session = _make_voice_session()
+
+        panel_msg = MagicMock()
+        panel_msg.author = channel.guild.me
+        panel_embed = MagicMock()
+        panel_embed.title = "ボイスチャンネル設定"
+        panel_msg.embeds = [panel_embed]
+        panel_msg.edit = AsyncMock()
+        channel.pins = AsyncMock(return_value=[panel_msg])
+
+        mock_factory = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            await refresh_panel_embed(channel, user_limit_override=2)
+
+        call_kwargs = panel_msg.edit.call_args[1]
+        field_values = [field.value for field in call_kwargs["embed"].fields]
+        assert "2" in field_values
+        assert "99" not in field_values
 
     async def test_no_session_does_nothing(self) -> None:
         """セッションが見つからない場合は何もしない。"""

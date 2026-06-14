@@ -244,7 +244,6 @@ async def create_voice_session(
     channel_id: str,
     owner_id: str,
     name: str,
-    user_limit: int = 0,
 ) -> VoiceSession:
     """新しい VC セッションを DB に登録する。
 
@@ -256,8 +255,6 @@ async def create_voice_session(
         channel_id (str): 作成された一時 VC の ID。
         owner_id (str): チャンネルオーナーの Discord ユーザー ID。
         name (str): チャンネル名。
-        user_limit (int): 人数制限 (0 = 無制限)。
-
     Returns:
         VoiceSession: 作成された VoiceSession オブジェクト。
 
@@ -295,7 +292,6 @@ async def create_voice_session(
         channel_id=channel_id,
         owner_id=owner_id,
         name=name,
-        user_limit=user_limit,
     )
     session.add(voice_session)
     await session.commit()
@@ -308,7 +304,6 @@ async def update_voice_session(
     voice_session: VoiceSession,
     *,
     name: str | None = None,
-    user_limit: int | None = None,
     is_locked: bool | None = None,
     is_hidden: bool | None = None,
     owner_id: str | None = None,
@@ -322,7 +317,6 @@ async def update_voice_session(
         session (AsyncSession): DB セッション。
         voice_session (VoiceSession): 更新対象の VoiceSession オブジェクト。
         name (str | None): 新しいチャンネル名 (None なら変更しない)。
-        user_limit (int | None): 新しい人数制限 (None なら変更しない)。
         is_locked (bool | None): 新しいロック状態 (None なら変更しない)。
         is_hidden (bool | None): 新しい非表示状態 (None なら変更しない)。
         owner_id (str | None): 新しいオーナー ID (None なら変更しない)。
@@ -352,7 +346,6 @@ async def update_voice_session(
                 session,
                 voice_session,
                 name="New Name",
-                user_limit=5,
                 is_hidden=True,
             )
 
@@ -363,8 +356,6 @@ async def update_voice_session(
     # None でないフィールドだけ更新する (部分更新パターン)
     if name is not None:
         voice_session.name = name
-    if user_limit is not None:
-        voice_session.user_limit = user_limit
     if is_locked is not None:
         voice_session.is_locked = is_locked
     if is_hidden is not None:

@@ -148,7 +148,7 @@ async def _find_panel_message(
 
 
 def create_control_panel_embed(
-    session: VoiceSession, owner: discord.Member
+    session: VoiceSession, owner: discord.Member, *, user_limit: int
 ) -> discord.Embed:
     """コントロールパネルの Embed (情報表示部分) を作成する。
 
@@ -157,6 +157,7 @@ def create_control_panel_embed(
     Args:
         session: DB の VoiceSession オブジェクト
         owner: チャンネルオーナーの Discord メンバー
+        user_limit: Discord のチャンネル実体に設定された人数制限
 
     Returns:
         組み立てた Embed オブジェクト
@@ -169,7 +170,7 @@ def create_control_panel_embed(
     )
 
     lock_status = "ロック中" if session.is_locked else "未ロック"
-    limit_status = str(session.user_limit) if session.user_limit > 0 else "無制限"
+    limit_status = str(user_limit) if user_limit > 0 else "無制限"
 
     embed.add_field(name="状態", value=lock_status, inline=True)
     embed.add_field(name="人数制限", value=limit_status, inline=True)
@@ -177,8 +178,18 @@ def create_control_panel_embed(
     return embed
 
 
+def _get_channel_user_limit(channel: discord.VoiceChannel) -> int:
+    """Discord のチャンネル実体に設定された人数制限を返す。"""
+    user_limit = getattr(channel, "user_limit", None)
+    if isinstance(user_limit, int):
+        return user_limit
+    return 0
+
+
 async def refresh_panel_embed(
     channel: discord.VoiceChannel,
+    *,
+    user_limit_override: int | None = None,
 ) -> None:
     """パネルメッセージの Embed を最新の DB 状態で更新する。"""
     async with async_session() as db_session:
@@ -196,7 +207,15 @@ async def refresh_panel_embed(
             )
             return
 
-        embed = create_control_panel_embed(voice_session, owner)
+        embed = create_control_panel_embed(
+            voice_session,
+            owner,
+            user_limit=(
+                user_limit_override
+                if user_limit_override is not None
+                else _get_channel_user_limit(channel)
+            ),
+        )
 
         # パネルメッセージを探して更新 (ピン → 履歴の順)
         panel_msg = await _find_panel_message(channel)
@@ -254,7 +273,11 @@ async def repost_panel(
                 )
 
         # 新パネル送信
-        embed = create_control_panel_embed(voice_session, owner)
+        embed = create_control_panel_embed(
+            voice_session,
+            owner,
+            user_limit=_get_channel_user_limit(channel),
+        )
         view = ControlPanelView(
             voice_session.id,
             voice_session.is_locked,
@@ -404,9 +427,6 @@ class UserLimitModal(discord.ui.Modal, title="人数制限変更"):
             if isinstance(channel, discord.VoiceChannel):
                 await channel.edit(user_limit=new_limit)
 
-            # DB を更新
-            await update_voice_session(db_session, voice_session, user_limit=new_limit)
-
         limit_text = str(new_limit) if new_limit > 0 else "無制限"
 
         # チャンネルに変更通知を送信
@@ -423,14 +443,16 @@ class UserLimitModal(discord.ui.Modal, title="人数制限変更"):
                 )
                 if cog is not None:
                     try:
-                        await cog.enforce_all_members(channel)  # type: ignore[attr-defined]
+                        await cog.enforce_all_members(  # type: ignore[attr-defined]
+                            channel, user_limit_override=new_limit
+                        )
                     except Exception:
                         logger.exception(
                             "Failed to enforce user_limit on channel %s",
                             channel.id,
                         )
             await channel.send(f"👥 人数制限が **{limit_text}** に変更されました。")
-            await refresh_panel_embed(channel)
+            await refresh_panel_embed(channel, user_limit_override=new_limit)
         else:
             await interaction.response.defer()
 
@@ -1236,7 +1258,11 @@ class ControlPanelView(discord.ui.View):
                 # Embed を更新
                 owner = interaction.guild.get_member(owner_id)
                 if owner:
-                    embed = create_control_panel_embed(voice_session, owner)
+                    embed = create_control_panel_embed(
+                        voice_session,
+                        owner,
+                        user_limit=_get_channel_user_limit(channel),
+                    )
                 else:
                     embed = None
 
@@ -1339,7 +1365,11 @@ class ControlPanelView(discord.ui.View):
                 # Embed を更新
                 owner = interaction.guild.get_member(int(voice_session.owner_id))
                 if owner:
-                    embed = create_control_panel_embed(voice_session, owner)
+                    embed = create_control_panel_embed(
+                        voice_session,
+                        owner,
+                        user_limit=_get_channel_user_limit(channel),
+                    )
                 else:
                     embed = None
 
@@ -1394,7 +1424,11 @@ class ControlPanelView(discord.ui.View):
             if voice_session:
                 owner = interaction.guild.get_member(int(voice_session.owner_id))
                 if owner:
-                    embed = create_control_panel_embed(voice_session, owner)
+                    embed = create_control_panel_embed(
+                        voice_session,
+                        owner,
+                        user_limit=_get_channel_user_limit(channel),
+                    )
                 else:
                     embed = None
             else:

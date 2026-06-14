@@ -129,14 +129,12 @@ class TestVoiceSessionOperations:
             channel_id="789",
             owner_id="111",
             name="Test Channel",
-            user_limit=5,
         )
 
         assert session.id is not None
         assert session.channel_id == "789"
         assert session.owner_id == "111"
         assert session.name == "Test Channel"
-        assert session.user_limit == 5
 
     async def test_get_voice_session(self, db_session: AsyncSession) -> None:
         """Test getting a voice session."""
@@ -194,14 +192,12 @@ class TestVoiceSessionOperations:
             db_session,
             session,
             name="New Name",
-            user_limit=10,
             is_locked=True,
             is_hidden=True,
             owner_id="222",
         )
 
         assert updated.name == "New Name"
-        assert updated.user_limit == 10
         assert updated.is_locked is True
         assert updated.is_hidden is True
         assert updated.owner_id == "222"
@@ -217,13 +213,11 @@ class TestVoiceSessionOperations:
             channel_id="789",
             owner_id="111",
             name="Original",
-            user_limit=5,
         )
 
         updated = await update_voice_session(db_session, session, name="Renamed")
 
         assert updated.name == "Renamed"
-        assert updated.user_limit == 5
         assert updated.is_locked is False
         assert updated.is_hidden is False
         assert updated.owner_id == "111"
@@ -285,7 +279,6 @@ class TestVoiceSessionOperations:
 
         assert session.is_locked is False
         assert session.is_hidden is False
-        assert session.user_limit == 0
 
 
 class TestVoiceSessionMemberOperations:

@@ -71,7 +71,6 @@ def _make_voice_session(
     channel_id: str = "100",
     owner_id: str = "1",
     name: str = "Test channel",
-    user_limit: int = 0,
     is_locked: bool = False,
     is_hidden: bool = False,
 ) -> MagicMock:
@@ -81,7 +80,6 @@ def _make_voice_session(
     vs.channel_id = channel_id
     vs.owner_id = owner_id
     vs.name = name
-    vs.user_limit = user_limit
     vs.is_locked = is_locked
     vs.is_hidden = is_hidden
     return vs
@@ -154,7 +152,7 @@ class TestCreateControlPanelEmbed:
         owner = MagicMock(spec=discord.Member)
         owner.mention = "<@1>"
 
-        embed = create_control_panel_embed(session, owner)
+        embed = create_control_panel_embed(session, owner, user_limit=0)
 
         assert embed.title == "ボイスチャンネル設定"
         assert "<@1>" in (embed.description or "")
@@ -165,7 +163,7 @@ class TestCreateControlPanelEmbed:
         owner = MagicMock(spec=discord.Member)
         owner.mention = "<@1>"
 
-        embed = create_control_panel_embed(session, owner)
+        embed = create_control_panel_embed(session, owner, user_limit=0)
 
         field_values = [f.value for f in embed.fields]
         assert "ロック中" in field_values
@@ -176,29 +174,29 @@ class TestCreateControlPanelEmbed:
         owner = MagicMock(spec=discord.Member)
         owner.mention = "<@1>"
 
-        embed = create_control_panel_embed(session, owner)
+        embed = create_control_panel_embed(session, owner, user_limit=0)
 
         field_values = [f.value for f in embed.fields]
         assert "未ロック" in field_values
 
     def test_user_limit_display(self) -> None:
         """人数制限の表示 (制限あり)。"""
-        session = _make_voice_session(user_limit=10)
+        session = _make_voice_session()
         owner = MagicMock(spec=discord.Member)
         owner.mention = "<@1>"
 
-        embed = create_control_panel_embed(session, owner)
+        embed = create_control_panel_embed(session, owner, user_limit=10)
 
         field_values = [f.value for f in embed.fields]
         assert "10" in field_values
 
     def test_unlimited_display(self) -> None:
         """人数制限の表示 (無制限)。"""
-        session = _make_voice_session(user_limit=0)
+        session = _make_voice_session()
         owner = MagicMock(spec=discord.Member)
         owner.mention = "<@1>"
 
-        embed = create_control_panel_embed(session, owner)
+        embed = create_control_panel_embed(session, owner, user_limit=0)
 
         field_values = [f.value for f in embed.fields]
         assert "無制限" in field_values
@@ -389,7 +387,7 @@ class TestUserLimitModal:
             await modal.on_submit(interaction)
 
             interaction.channel.edit.assert_awaited_once_with(user_limit=10)
-            mock_update.assert_awaited_once()
+            mock_update.assert_not_awaited()
             # チャンネルに通知メッセージが送信される
             interaction.channel.send.assert_awaited_once()
             msg = interaction.channel.send.call_args[0][0]
@@ -459,6 +457,54 @@ class TestUserLimitModal:
             # チャンネルへの通知で「無制限」が含まれる
             msg = interaction.channel.send.call_args[0][0]
             assert "無制限" in msg
+
+    async def test_enforces_with_submitted_limit_when_channel_cache_is_stale(
+        self,
+    ) -> None:
+        """edit 直後の古い channel.user_limit ではなく送信値で遡及キックする。"""
+        modal = UserLimitModal(session_id=1)
+        modal.limit = MagicMock()
+        modal.limit.value = "2"
+
+        interaction = _make_interaction(user_id=1)
+        interaction.channel.user_limit = 99
+        voice_session = _make_voice_session(owner_id="1")
+
+        cog = MagicMock()
+        cog.enforce_all_members = AsyncMock()
+
+        class FakeBot:
+            def get_cog(self, name: str) -> MagicMock | None:
+                return cog if name == "VoiceCog" else None
+
+        interaction.client = FakeBot()
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.commands.Bot", FakeBot),
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+            patch(
+                "src.ui.control_panel.update_voice_session",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "src.ui.control_panel.refresh_panel_embed",
+                new_callable=AsyncMock,
+            ) as mock_refresh,
+        ):
+            await modal.on_submit(interaction)
+
+        cog.enforce_all_members.assert_awaited_once_with(
+            interaction.channel, user_limit_override=2
+        )
+        mock_refresh.assert_awaited_once_with(
+            interaction.channel, user_limit_override=2
+        )
 
 
 # ===========================================================================

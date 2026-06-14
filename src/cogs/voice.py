@@ -360,10 +360,10 @@ class VoiceCog(commands.Cog):
         """メンバーが一時 VC の制限に違反しているかを判定する。
 
         判定ルール:
-          - Bot / Administrator / オーナーは常に許可
+          - Bot / Administrator / オーナー本人は常に許可
           - 個別の connect=False overwrite (ブロック) があればキック
           - ロック中: 個別の connect=True がなければキック
-          - 人数制限超過: overwrite に関係なく超過分はキック
+          - 人数制限超過: Bot も人数枠として数え、overwrite に関係なく超過分はキック
 
         Args:
             member: 判定対象のメンバー
@@ -396,16 +396,20 @@ class VoiceCog(commands.Cog):
         # --- 人数制限チェック ---
         # 「メンバーを移動」権限による Discord の user_limit バイパスを
         # Bot 側で強制する。overwrite に関わらず超過分はキックする。
-        if voice_session.user_limit > 0:
-            count = (
-                current_count
-                if current_count is not None
-                else len([m for m in channel.members if not m.bot])
-            )
-            if count > voice_session.user_limit:
+        user_limit = self._get_channel_user_limit(channel)
+        if user_limit > 0:
+            count = current_count if current_count is not None else len(channel.members)
+            if count > user_limit:
                 return "人数制限を超えているため"
 
         return None
+
+    def _get_channel_user_limit(self, channel: discord.VoiceChannel) -> int:
+        """人数制限は Discord のチャンネル設定だけを正とする。"""
+        channel_limit = getattr(channel, "user_limit", None)
+        if isinstance(channel_limit, int):
+            return channel_limit
+        return 0
 
     async def _kick_with_notification(
         self, member: discord.Member, channel: discord.VoiceChannel, reason: str
@@ -524,15 +528,22 @@ class VoiceCog(commands.Cog):
                 e,
             )
 
-    async def enforce_all_members(self, channel: discord.VoiceChannel) -> int:
+    async def enforce_all_members(
+        self,
+        channel: discord.VoiceChannel,
+        *,
+        user_limit_override: int | None = None,
+    ) -> int:
         """チャンネル内の既存メンバー全員に制限を適用する (遡及キック)。
 
         ロックの ON 切替時や人数制限の引き下げ時に呼び出す。
         - ブロック/ロック違反は無条件にキック
-        - 人数制限超過は新しい参加者から順にキック (オーナー/Admin は保護)
+        - 人数制限超過は新しい参加者から順にキック (Bot/オーナー/Admin は保護)
 
         Args:
             channel: 対象の VC
+            user_limit_override: 直前に適用した人数制限。指定時は
+                Discord.py のローカルチャンネルキャッシュより優先する。
 
         Returns:
             キックしたメンバー数
@@ -559,14 +570,20 @@ class VoiceCog(commands.Cog):
                 kicked += 1
 
         # --- パス 2: 人数制限の超過分を新参者からキック ---
-        if voice_session.user_limit > 0:
-            remaining = [m for m in channel.members if not m.bot]
-            excess = len(remaining) - voice_session.user_limit
+        user_limit = (
+            user_limit_override
+            if user_limit_override is not None
+            else self._get_channel_user_limit(channel)
+        )
+        if user_limit > 0:
+            remaining = list(channel.members)
+            excess = len(remaining) - user_limit
             if excess > 0:
                 kickable = [
                     m
                     for m in remaining
-                    if str(m.id) != voice_session.owner_id
+                    if not m.bot
+                    and str(m.id) != voice_session.owner_id
                     and not m.guild_permissions.administrator
                 ]
                 # 参加時刻が新しい順 (= 後から入った人) を先にキック。
@@ -712,7 +729,6 @@ class VoiceCog(commands.Cog):
                     channel_id=str(new_channel.id),
                     owner_id=str(member.id),
                     name=channel_name,
-                    user_limit=lobby.default_user_limit,
                 )
                 # オーナーを最初のメンバーとして DB に登録
                 await add_voice_session_member(
@@ -770,7 +786,11 @@ class VoiceCog(commands.Cog):
                         raise owner_result
 
                 # コントロールパネル (Embed + ボタン) を送信
-                embed = create_control_panel_embed(voice_session, member)
+                embed = create_control_panel_embed(
+                    voice_session,
+                    member,
+                    user_limit=self._get_channel_user_limit(new_channel),
+                )
                 view = ControlPanelView(
                     voice_session.id,
                     voice_session.is_locked,

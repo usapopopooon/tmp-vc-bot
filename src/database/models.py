@@ -91,7 +91,6 @@ class VoiceSession(Base):
     )
     owner_id: Mapped[str] = mapped_column(String, nullable=False)
     name: Mapped[str] = mapped_column(String, nullable=False)
-    user_limit: Mapped[int] = mapped_column(Integer, default=0)
     is_locked: Mapped[bool] = mapped_column(Boolean, default=False)
     is_hidden: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -103,13 +102,6 @@ class VoiceSession(Base):
     @validates("channel_id", "owner_id")
     def _validate_ids(self, key: str, value: str) -> str:
         return _validate_discord_id(value, key)
-
-    @validates("user_limit")
-    def _validate_user_limit(self, _key: str, value: int) -> int:
-        if value < 0:
-            msg = f"user_limit must be >= 0, got: {value}"
-            raise ValueError(msg)
-        return value
 
     def __repr__(self) -> str:
         return (
