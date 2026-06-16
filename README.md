@@ -95,6 +95,30 @@ Discord Developer Portal → OAuth2 → URL Generator で以下を選択:
 
 ## デプロイ
 
+### Coolify
+
+Coolify では `docker-compose.coolify.yml` を指定してデプロイする。
+Discord bot は HTTP ポートを公開しないワーカーなので、ドメイン/プロキシ設定は不要。
+
+Coolify の環境変数に最低限以下を設定する:
+
+```bash
+DISCORD_TOKEN=...
+POSTGRES_PASSWORD=強いランダム文字列
+POSTGRES_USER=tmp_vc_bot
+POSTGRES_DB=tmp_vc_bot
+LOG_LEVEL=INFO
+SYNC_GUILD_IDS=
+```
+
+単一サーバー運用でメモリを詰めるため、Coolify 用 compose は以下に制限している:
+
+- bot: 192MB、DB 接続プール `1 + overflow 1`
+- PostgreSQL: 160MB、`max_connections=10`、`shared_buffers=16MB`
+
+この設定で OOM が出る場合は、まず `bot.mem_limit` を `256m`、
+次に `db.mem_limit` を `192m` へ上げる。
+
 ### Railway
 
 `railway.toml` がリポジトリにあるので、Railway から GitHub リポを連携するだけで

@@ -6,6 +6,9 @@ WORKDIR /app
 # under Docker/Railway (otherwise stdout is block-buffered when not a TTY,
 # and our app logs only flush when the process exits or the buffer fills).
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_NO_CACHE_DIR=1
+ENV MALLOC_ARENA_MAX=2
 
 # Install dependencies
 COPY pyproject.toml .
