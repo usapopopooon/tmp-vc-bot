@@ -4,6 +4,8 @@ pydantic-settings を使い、.env ファイルや環境変数から設定値を
 Bot トークンや DB 接続先など、環境ごとに異なる値をここで一元管理する。
 """
 
+from urllib.parse import quote
+
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -41,8 +43,13 @@ class Settings(BaseSettings):
             )
         return self
 
-    # データベース接続 URL
-    database_url: str = DEFAULT_DATABASE_URL
+    # データベース接続 URL。
+    # 未指定の場合は POSTGRES_* から組み立てる。
+    database_url: str = ""
+    postgres_host: str = "db"
+    postgres_user: str = "tmp_vc_bot"
+    postgres_password: str = ""
+    postgres_db: str = "tmp_vc_bot"
 
     @property
     def async_database_url(self) -> str:
@@ -52,7 +59,18 @@ class Settings(BaseSettings):
         - postgresql://...         → postgresql+asyncpg://... (標準形式)
         - postgresql+asyncpg://... → そのまま
         """
-        url = self.database_url
+        url = self.database_url.strip()
+        if not url:
+            if self.postgres_password:
+                user = quote(self.postgres_user)
+                password = quote(self.postgres_password)
+                database = quote(self.postgres_db)
+                url = (
+                    "postgresql+asyncpg://"
+                    f"{user}:{password}@{self.postgres_host}:5432/{database}"
+                )
+            else:
+                url = DEFAULT_DATABASE_URL
         if url.startswith("postgresql+asyncpg://"):
             return url
         if url.startswith("postgres://"):

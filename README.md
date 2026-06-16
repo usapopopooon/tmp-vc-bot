@@ -27,7 +27,8 @@ Discord の **一時ボイスチャンネル (Ephemeral VC) 機能だけ** を�
 
 ```bash
 cp .env.example .env
-# .env を編集して DISCORD_TOKEN と DATABASE_URL を設定
+# .env を編集して DISCORD_TOKEN を設定
+# make run でホストから直接起動する場合だけ DATABASE_URL も localhost 向けに設定
 make setup
 make ci          # lint + type check
 docker compose up -d db
@@ -97,7 +98,7 @@ Discord Developer Portal → OAuth2 → URL Generator で以下を選択:
 
 ### Coolify
 
-Coolify では `docker-compose.coolify.yml` を指定してデプロイする。
+Coolify では通常の `docker-compose.yml` を使ってデプロイする。
 Discord bot は HTTP ポートを公開しないワーカーなので、ドメイン/プロキシ設定は不要。
 
 Coolify の環境変数に最低限以下を設定する:
@@ -107,12 +108,15 @@ DISCORD_TOKEN=...
 POSTGRES_PASSWORD=強いランダム文字列
 ```
 
-必要に応じて以下も設定できる。未設定なら `docker-compose.coolify.yml` の
+必要に応じて以下も設定できる。未設定なら `docker-compose.yml` の
 デフォルト値が使われる:
 
 ```bash
 POSTGRES_USER=tmp_vc_bot
 POSTGRES_DB=tmp_vc_bot
+POSTGRES_HOST=db
+POSTGRES_PORT=127.0.0.1:5432
+DATABASE_URL=
 LOG_LEVEL=INFO
 SYNC_GUILD_IDS=
 SYNC_GUILD_ID=
