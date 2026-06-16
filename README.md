@@ -31,9 +31,8 @@ cp .env.example .env
 # make run でホストから直接起動する場合だけ DATABASE_URL も localhost 向けに設定
 make setup
 make ci          # lint + type check
-docker compose up -d db
-.venv/bin/alembic upgrade head
-make run
+# Docker/Coolify と同じ構成で起動する場合
+docker compose up -d
 ```
 
 ## 開発
@@ -44,13 +43,7 @@ make test                             # 全テスト実行
 make lint                             # ruff check + format
 make typecheck                        # mypy
 make ci                               # CI と同じチェック一式
-```
-
-Docker 経由:
-
-```bash
-docker compose --profile dev up test  # テスト
-docker compose --profile dev up lint  # lint
+make test-db-stop                     # テスト用 PostgreSQL を停止
 ```
 
 ## マルチサーバー運用
@@ -115,7 +108,6 @@ POSTGRES_PASSWORD=強いランダム文字列
 POSTGRES_USER=tmp_vc_bot
 POSTGRES_DB=tmp_vc_bot
 POSTGRES_HOST=db
-POSTGRES_PORT=127.0.0.1:5432
 DATABASE_URL=
 LOG_LEVEL=INFO
 SYNC_GUILD_IDS=
@@ -123,18 +115,13 @@ SYNC_GUILD_ID=
 DATABASE_REQUIRE_SSL=false
 DB_POOL_SIZE=1
 DB_MAX_OVERFLOW=1
-BOT_MEM_LIMIT=192m
-BOT_MEMSWAP_LIMIT=192m
-POSTGRES_MEM_LIMIT=160m
-POSTGRES_MEMSWAP_LIMIT=160m
+BOT_MEMORY_LIMIT=192m
+BOT_MEMORY_RESERVATION=128m
+POSTGRES_MEMORY_LIMIT=160m
+POSTGRES_MEMORY_RESERVATION=96m
 POSTGRES_SHM_SIZE=32mb
 POSTGRES_MAX_CONNECTIONS=10
 POSTGRES_SHARED_BUFFERS=16MB
-POSTGRES_EFFECTIVE_CACHE_SIZE=64MB
-POSTGRES_WORK_MEM=2MB
-POSTGRES_MAINTENANCE_WORK_MEM=16MB
-POSTGRES_WAL_BUFFERS=1MB
-POSTGRES_AUTOVACUUM_MAX_WORKERS=1
 ```
 
 単一サーバー運用でメモリを詰めるため、Coolify 用 compose は以下に制限している:
