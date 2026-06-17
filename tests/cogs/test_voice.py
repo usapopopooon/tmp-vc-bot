@@ -113,6 +113,15 @@ def _mock_async_session() -> tuple[MagicMock, AsyncMock]:
     return mock_factory, mock_session
 
 
+def _permission_call_for(mock: AsyncMock, target: object) -> object:
+    """Find the set_permissions await call for a target."""
+    for call in mock.await_args_list:
+        if call.args and call.args[0] is target:
+            return call
+    msg = f"set_permissions was not awaited for target {target!r}"
+    raise AssertionError(msg)
+
+
 class TestRecordJoinCache:
     """Tests for _record_join_cache."""
 
@@ -665,8 +674,8 @@ class TestHandleLobbyJoin:
             new_channel.delete.assert_awaited_once()
             mock_delete.assert_awaited_once_with(mock_session, "200")
 
-    async def test_bulk_moves_all_lobby_members(self) -> None:
-        """ロビーにいる全メンバーを新VCに一括移動する。"""
+    async def test_moves_only_triggering_lobby_member(self) -> None:
+        """ロビー参加者ごとに専用 VC を作り、起点ユーザーだけ移動する。"""
         cog = _make_cog()
         owner = _make_member(1)
         peer = _make_member(2)
@@ -724,7 +733,7 @@ class TestHandleLobbyJoin:
             await cog._handle_lobby_join(owner, channel)
 
         owner.move_to.assert_awaited_once_with(new_channel)
-        peer.move_to.assert_awaited_once_with(new_channel)
+        peer.move_to.assert_not_awaited()
 
 
 # ===========================================================================
@@ -918,6 +927,16 @@ class TestTransferOwnership:
         channel.send = AsyncMock()
         channel.guild = MagicMock()
         channel.guild.get_member = lambda uid: new_owner if uid == 2 else None
+        channel.overwrites_for = MagicMock(
+            side_effect=lambda target: (
+                discord.PermissionOverwrite(
+                    connect=True,
+                    read_message_history=True,
+                )
+                if target is old_owner
+                else discord.PermissionOverwrite(connect=True)
+            )
+        )
 
         voice_session = _make_voice_session(channel_id="100", owner_id="1")
 
@@ -946,11 +965,16 @@ class TestTransferOwnership:
 
             # set_permissions が2回呼ばれる (旧オーナー解除 + 新オーナー付与)
             assert channel.set_permissions.await_count == 2
-            calls = channel.set_permissions.call_args_list
+            old_call = _permission_call_for(channel.set_permissions, old_owner)
+            old_overwrite = old_call.kwargs["overwrite"]
             # 旧オーナー: read_message_history=None
-            assert calls[0][1]["read_message_history"] is None
+            assert old_overwrite.read_message_history is None
+            assert old_overwrite.connect is True
+            new_call = _permission_call_for(channel.set_permissions, new_owner)
+            new_overwrite = new_call.kwargs["overwrite"]
             # 新オーナー: read_message_history=True
-            assert calls[1][1]["read_message_history"] is True
+            assert new_overwrite.read_message_history is True
+            assert new_overwrite.connect is True
 
     async def test_reposts_panel(self) -> None:
         """コントロールパネルが再投稿される。"""
@@ -2306,9 +2330,7 @@ class TestEnforceChannelRestrictions:
         channel = _make_channel(100, [member])
         channel.set_permissions = AsyncMock()
         # 既存 overwrite なし (view_channel=None)
-        overwrites = MagicMock()
-        overwrites.connect = None
-        overwrites.view_channel = None
+        overwrites = discord.PermissionOverwrite(connect=True)
         channel.overwrites_for = MagicMock(return_value=overwrites)
 
         voice_session = _make_voice_session(
@@ -2327,7 +2349,10 @@ class TestEnforceChannelRestrictions:
             result = await cog._enforce_channel_restrictions(member, channel)
 
         assert result is False
-        channel.set_permissions.assert_awaited_once_with(member, view_channel=True)
+        call = _permission_call_for(channel.set_permissions, member)
+        overwrite = call.kwargs["overwrite"]
+        assert overwrite.connect is True
+        assert overwrite.view_channel is True
 
     async def test_skips_view_grant_when_not_hidden(self) -> None:
         """非表示でないチャンネルでは view_channel を付与しない。"""
@@ -4404,6 +4429,7 @@ class TestDeduplicationClaimSucceeds:
 
             assert result is True
             mock_claim.assert_awaited_once()
+            mock_session.commit.assert_awaited_once()
             member.move_to.assert_awaited_once_with(None)
 
 

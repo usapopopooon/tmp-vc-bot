@@ -186,6 +186,70 @@ def _get_channel_user_limit(channel: discord.VoiceChannel) -> int:
     return 0
 
 
+def _copy_overwrite(
+    overwrite: discord.PermissionOverwrite | None,
+) -> discord.PermissionOverwrite:
+    """PermissionOverwrite を複製する。"""
+    if not isinstance(overwrite, discord.PermissionOverwrite):
+        return discord.PermissionOverwrite()
+    allow, deny = overwrite.pair()
+    return discord.PermissionOverwrite.from_pair(allow, deny)
+
+
+async def _update_permission_overwrite(
+    channel: discord.VoiceChannel,
+    target: discord.Member | discord.Role,
+    **permissions: bool | None,
+) -> None:
+    """既存の PermissionOverwrite を保ったまま一部の権限だけ更新する。"""
+    overwrite = _copy_overwrite(channel.overwrites_for(target))
+    overwrite.update(**permissions)
+    if overwrite.is_empty():
+        await channel.set_permissions(target, overwrite=None)
+    else:
+        await channel.set_permissions(target, overwrite=overwrite)
+
+
+async def _edit_component_error(
+    interaction: discord.Interaction,
+    content: str,
+) -> None:
+    """コンポーネント操作のエラーを ephemeral メッセージ上に表示する。"""
+    try:
+        await interaction.response.edit_message(content=content, view=None)
+    except discord.InteractionResponded:
+        await interaction.followup.send(content, ephemeral=True)
+
+
+async def _ensure_current_owner(interaction: discord.Interaction) -> bool:
+    """セレクト/確認 UI 操作時点でも現在のオーナーか確認する。"""
+    if interaction.channel_id is None:
+        await _edit_component_error(interaction, "セッションが見つかりません。")
+        return False
+
+    async with async_session() as db_session:
+        voice_session = await get_voice_session(db_session, str(interaction.channel_id))
+        if not voice_session:
+            await _edit_component_error(interaction, "セッションが見つかりません。")
+            return False
+
+        if not is_owner(voice_session.owner_id, interaction.user.id):
+            await _edit_component_error(
+                interaction,
+                "チャンネルオーナーのみ操作できます。",
+            )
+            return False
+
+    return True
+
+
+class _OwnerOnlyView(discord.ui.View):
+    """現在のチャンネルオーナーだけが操作できる ephemeral View。"""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _ensure_current_owner(interaction)
+
+
 async def refresh_panel_embed(
     channel: discord.VoiceChannel,
     *,
@@ -286,7 +350,15 @@ async def repost_panel(
         )
         bot.add_view(view)
         try:
-            await channel.send(embed=embed, view=view)
+            panel_msg = await channel.send(embed=embed, view=view)
+            try:
+                await panel_msg.pin()
+            except discord.HTTPException as e:
+                logger.debug(
+                    "Failed to pin reposted panel in channel %s: %s",
+                    channel.id,
+                    e,
+                )
             logger.debug("Reposted panel in channel %s", channel.id)
         except discord.HTTPException as e:
             logger.error(
@@ -463,7 +535,7 @@ class UserLimitModal(discord.ui.Modal, title="人数制限変更"):
 # ephemeral = 操作者にだけ見えるメッセージとして表示される
 
 
-class TransferSelectView(discord.ui.View):
+class TransferSelectView(_OwnerOnlyView):
     """オーナー譲渡先を選択するセレクトメニュー。
 
     チャンネル内のメンバー一覧をドロップダウンで表示する。
@@ -529,12 +601,17 @@ class TransferSelectMenu(discord.ui.Select[Any]):
                 # テキストチャット権限の移行
                 # 旧オーナー: read_message_history=None (ロール設定に戻す)
                 if isinstance(interaction.user, discord.Member):
-                    await channel.set_permissions(
+                    await _update_permission_overwrite(
+                        channel,
                         interaction.user,
                         read_message_history=None,
                     )
                 # 新オーナー: read_message_history=True (閲覧可)
-                await channel.set_permissions(new_owner, read_message_history=True)
+                await _update_permission_overwrite(
+                    channel,
+                    new_owner,
+                    read_message_history=True,
+                )
 
                 # DB のオーナー ID を更新
                 await update_voice_session(
@@ -553,7 +630,7 @@ class TransferSelectMenu(discord.ui.Select[Any]):
             await repost_panel(channel, interaction.client)  # type: ignore[arg-type]
 
 
-class KickSelectView(discord.ui.View):
+class KickSelectView(_OwnerOnlyView):
     """キック対象を選択するセレクトメニュー。
 
     チャンネル内のメンバー一覧をドロップダウンで表示する。
@@ -607,7 +684,7 @@ class KickSelectMenu(discord.ui.Select[Any]):
         await channel.send(f"👟 {user_to_kick.mention} がキックされました。")
 
 
-class BlockSelectView(discord.ui.View):
+class BlockSelectView(_OwnerOnlyView):
     """ブロック対象を選択するユーザーセレクト。
 
     ブロック = connect=False で接続権限を拒否する。
@@ -643,7 +720,7 @@ class BlockSelectView(discord.ui.View):
             return
 
         # connect=False で接続を拒否
-        await channel.set_permissions(user_to_block, connect=False)
+        await _update_permission_overwrite(channel, user_to_block, connect=False)
 
         # 既に VC にいる場合はキック
         if (
@@ -658,7 +735,7 @@ class BlockSelectView(discord.ui.View):
         await channel.send(f"🚫 {user_to_block.mention} がブロックされました。")
 
 
-class AllowSelectView(discord.ui.View):
+class AllowSelectView(_OwnerOnlyView):
     """許可対象を選択するユーザーセレクト。
 
     許可 = connect=True で接続権限を許可する。
@@ -685,13 +762,13 @@ class AllowSelectView(discord.ui.View):
             return
 
         # connect=True で接続を許可
-        await channel.set_permissions(user_to_allow, connect=True)
+        await _update_permission_overwrite(channel, user_to_allow, connect=True)
         # ephemeral のセレクトメニューを削除し、チャンネルに通知
         await interaction.response.edit_message(content="\u200b", view=None)
         await channel.send(f"✅ {user_to_allow.mention} が許可されました。")
 
 
-class CameraToggleSelectView(discord.ui.View):
+class CameraToggleSelectView(_OwnerOnlyView):
     """カメラ権限をトグルするセレクトメニュー。
 
     チャンネル内のメンバー一覧をドロップダウンで表示する。
@@ -751,12 +828,12 @@ class CameraToggleSelectMenu(discord.ui.Select[Any]):
         overwrites = channel.overwrites_for(user)
         if overwrites.stream is False:
             # 禁止中 → 許可 (上書きを削除してデフォルトに戻す)
-            await channel.set_permissions(user, stream=None)
+            await _update_permission_overwrite(channel, user, stream=None)
             await interaction.response.edit_message(content="\u200b", view=None)
             await channel.send(f"📹 {user.mention} のカメラ配信が許可されました。")
         else:
             # 許可 → 禁止
-            await channel.set_permissions(user, stream=False)
+            await _update_permission_overwrite(channel, user, stream=False)
             await interaction.response.edit_message(content="\u200b", view=None)
             await channel.send(f"📵 {user.mention} のカメラ配信が禁止されました。")
 
@@ -879,7 +956,7 @@ class RegionSelectMenu(discord.ui.Select[Any]):
             await channel.send(f"🌏 リージョンが **{region_name}** に変更されました。")
 
 
-class DissolveConfirmView(discord.ui.View):
+class DissolveConfirmView(_OwnerOnlyView):
     """解散の確認ダイアログ。
 
     「解散する」ボタンで10秒カウントダウン後に全メンバーをキックし、
@@ -1181,19 +1258,22 @@ class ControlPanelView(discord.ui.View):
 
                 if new_locked_state:
                     # ロック: @everyone の接続を拒否
-                    await channel.set_permissions(
-                        interaction.guild.default_role, connect=False
+                    await _update_permission_overwrite(
+                        channel, interaction.guild.default_role, connect=False
                     )
                     # チャンネルに設定されている全ロールの connect も拒否
                     # ロールに connect=True があると @everyone の拒否が上書きされる
                     default_role = interaction.guild.default_role
                     for target in channel.overwrites:
                         if isinstance(target, discord.Role) and target != default_role:
-                            await channel.set_permissions(target, connect=False)
+                            await _update_permission_overwrite(
+                                channel, target, connect=False
+                            )
                     # オーナーにフル権限を付与
                     owner = interaction.guild.get_member(owner_id)
                     if owner:
-                        await channel.set_permissions(
+                        await _update_permission_overwrite(
+                            channel,
                             owner,
                             connect=True,
                             speak=True,
@@ -1226,16 +1306,26 @@ class ControlPanelView(discord.ui.View):
                             continue
                         if overwrite.connect is False:
                             # connect の上書きだけ削除 (他の権限は維持)
-                            await channel.set_permissions(target, connect=None)
-                    # @everyone の権限上書きを削除 (デフォルトに戻す)
-                    # overwrite=None で上書きごと削除
-                    await channel.set_permissions(
-                        interaction.guild.default_role, overwrite=None
+                            await _update_permission_overwrite(
+                                channel, target, connect=None
+                            )
+                    # @everyone の connect 拒否だけ削除 (他の権限は維持)
+                    await _update_permission_overwrite(
+                        channel, interaction.guild.default_role, connect=None
                     )
-                    # オーナーの特別権限も削除 (通常ユーザーに戻す)
+                    # オーナーのロック用特別権限だけ削除する
                     owner = interaction.guild.get_member(owner_id)
                     if owner:
-                        await channel.set_permissions(owner, overwrite=None)
+                        await _update_permission_overwrite(
+                            channel,
+                            owner,
+                            connect=None,
+                            speak=None,
+                            stream=None,
+                            move_members=None,
+                            mute_members=None,
+                            deafen_members=None,
+                        )
                     # チャンネル名の先頭から🔒を削除 (ある場合のみ)
                     if channel.name.startswith("🔒"):
                         try:
@@ -1341,19 +1431,21 @@ class ControlPanelView(discord.ui.View):
 
                 if new_hidden_state:
                     # 非表示: @everyone のチャンネル表示を拒否
-                    await channel.set_permissions(
-                        interaction.guild.default_role, view_channel=False
+                    await _update_permission_overwrite(
+                        channel, interaction.guild.default_role, view_channel=False
                     )
                     # 現在チャンネルにいるメンバーには表示を許可
                     for member in channel.members:
-                        await channel.set_permissions(member, view_channel=True)
+                        await _update_permission_overwrite(
+                            channel, member, view_channel=True
+                        )
                     button.label = "表示"
                     button.emoji = "👁️"
                 else:
                     # 表示: view_channel の上書きを削除
                     # view_channel=None で「上書きなし」にする (ロールの設定に従う)
-                    await channel.set_permissions(
-                        interaction.guild.default_role, view_channel=None
+                    await _update_permission_overwrite(
+                        channel, interaction.guild.default_role, view_channel=None
                     )
                     button.label = "非表示"
                     button.emoji = "🙈"

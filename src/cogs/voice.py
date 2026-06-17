@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
 import time
@@ -127,10 +126,24 @@ def _copy_overwrite(
     overwrite: discord.PermissionOverwrite | None,
 ) -> discord.PermissionOverwrite:
     """PermissionOverwrite を複製する。"""
-    if overwrite is None:
+    if not isinstance(overwrite, discord.PermissionOverwrite):
         return discord.PermissionOverwrite()
     allow, deny = overwrite.pair()
     return discord.PermissionOverwrite.from_pair(allow, deny)
+
+
+async def _update_permission_overwrite(
+    channel: discord.VoiceChannel,
+    target: discord.Member | discord.Role,
+    **permissions: bool | None,
+) -> None:
+    """既存の PermissionOverwrite を保ったまま一部の権限だけ更新する。"""
+    overwrite = _copy_overwrite(channel.overwrites_for(target))
+    overwrite.update(**permissions)
+    if overwrite.is_empty():
+        await channel.set_permissions(target, overwrite=None)
+    else:
+        await channel.set_permissions(target, overwrite=overwrite)
 
 
 class VoiceCog(commands.Cog):
@@ -497,6 +510,7 @@ class VoiceCog(commands.Cog):
                     event_key,
                 )
                 return False
+            await session.commit()
 
         await self._kick_with_notification(member, channel, reason)
         return True
@@ -519,7 +533,7 @@ class VoiceCog(commands.Cog):
         if overwrites.view_channel is True:
             return
         try:
-            await channel.set_permissions(member, view_channel=True)
+            await _update_permission_overwrite(channel, member, view_channel=True)
         except discord.HTTPException as e:
             logger.warning(
                 "Failed to grant view_channel to %s on hidden channel %s: %s",
@@ -745,45 +759,10 @@ class VoiceCog(commands.Cog):
             # move_to, send のいずれかが失敗した場合、
             # 不完全なチャンネルと DB レコードを両方クリーンアップする。
             try:
-                # ロビーにいる人間メンバーを一括移動する。
-                # スナップショットを作り、移動中の members 変化の影響を避ける。
-                lobby_members = [
-                    m
-                    for m in list(channel.members)
-                    if not m.bot and m.voice and m.voice.channel == channel
-                ]
-                # キャッシュ更新タイミングなどで members に載らないケースに備え、
-                # トリガーした本人は必ず移動対象に含める。
-                if (
-                    member not in lobby_members
-                    and member.voice
-                    and member.voice.channel == channel
-                ):
-                    lobby_members.append(member)
-
-                # 並列移動で待ち時間を短縮
-                move_results = await asyncio.gather(
-                    *(m.move_to(new_channel) for m in lobby_members),
-                    return_exceptions=True,
-                )
-                move_errors = [
-                    err
-                    for err in move_results
-                    if isinstance(err, discord.HTTPException)
-                ]
-                if move_errors:
-                    logger.warning(
-                        "Some members failed to move to channel %s: %d/%d failed",
-                        new_channel.id,
-                        len(move_errors),
-                        len(lobby_members),
-                    )
-                    # オーナー移動に失敗した場合は初期化失敗として扱い、
-                    # 既存挙動どおりチャンネル/DBをクリーンアップする。
-                    owner_idx = lobby_members.index(member)
-                    owner_result = move_results[owner_idx]
-                    if isinstance(owner_result, discord.HTTPException):
-                        raise owner_result
+                # 一時 VC は起点ユーザーごとに作成する。
+                # ロビー内の他メンバーまで移動すると、同時参加時に別ユーザーの
+                # 作成処理と競合して空 VC や所有者不在 VC ができる。
+                await member.move_to(new_channel)
 
                 # コントロールパネル (Embed + ボタン) を送信
                 embed = create_control_panel_embed(
@@ -982,8 +961,12 @@ class VoiceCog(commands.Cog):
         # 旧オーナー: read_message_history=None → ロール設定に戻す (= 読めなくなる)
         # 新オーナー: read_message_history=True → 読めるようにする
         try:
-            await channel.set_permissions(old_owner, read_message_history=None)
-            await channel.set_permissions(new_owner, read_message_history=True)
+            await _update_permission_overwrite(
+                channel, old_owner, read_message_history=None
+            )
+            await _update_permission_overwrite(
+                channel, new_owner, read_message_history=True
+            )
         except discord.HTTPException as e:
             logger.warning(
                 "Failed to update permissions for ownership transfer in channel %s: %s",

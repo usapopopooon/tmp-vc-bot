@@ -138,6 +138,30 @@ def _mock_async_session() -> tuple[MagicMock, AsyncMock]:
     return mock_factory, mock_session
 
 
+def _permission_call_for(mock: AsyncMock, target: object) -> object:
+    """Find the set_permissions await call for a target."""
+    for call in mock.await_args_list:
+        if call.args and call.args[0] is target:
+            return call
+    msg = f"set_permissions was not awaited for target {target!r}"
+    raise AssertionError(msg)
+
+
+def _assert_permission_field(
+    mock: AsyncMock,
+    target: object,
+    field: str,
+    expected: bool | None,
+) -> None:
+    """Assert a set_permissions call changed a specific overwrite field."""
+    call = _permission_call_for(mock, target)
+    overwrite = call.kwargs["overwrite"]
+    if overwrite is None:
+        assert expected is None
+        return
+    assert getattr(overwrite, field) is expected
+
+
 # ===========================================================================
 # create_control_panel_embed テスト
 # ===========================================================================
@@ -263,6 +287,72 @@ class TestInteractionCheck:
         ):
             result = await view.interaction_check(interaction)
             assert result is False
+
+
+class TestOwnerOnlyEphemeralViews:
+    """Tests for owner re-check on secondary ephemeral controls."""
+
+    async def test_select_view_allows_current_owner(self) -> None:
+        """セレクト表示後も現在オーナーなら操作を許可する。"""
+        view = AllowSelectView()
+        interaction = _make_interaction(user_id=1)
+        voice_session = _make_voice_session(owner_id="1")
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            result = await view.interaction_check(interaction)
+
+        assert result is True
+
+    async def test_select_view_rejects_stale_owner(self) -> None:
+        """譲渡後の旧オーナーが残ったセレクトを操作しても拒否する。"""
+        view = AllowSelectView()
+        interaction = _make_interaction(user_id=1)
+        voice_session = _make_voice_session(owner_id="2")
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            result = await view.interaction_check(interaction)
+
+        assert result is False
+        interaction.response.edit_message.assert_awaited_once()
+        msg = interaction.response.edit_message.call_args[1]["content"]
+        assert "オーナー" in msg
+
+    async def test_dissolve_confirm_rejects_stale_owner(self) -> None:
+        """解散確認も現在オーナーでなければ実行できない。"""
+        channel = MagicMock(spec=discord.VoiceChannel)
+        view = DissolveConfirmView(channel)
+        interaction = _make_interaction(user_id=1)
+        voice_session = _make_voice_session(owner_id="2")
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            result = await view.interaction_check(interaction)
+
+        assert result is False
+        interaction.response.edit_message.assert_awaited_once()
 
 
 # ===========================================================================
@@ -611,8 +701,11 @@ class TestLockButton:
             await view.lock_button.callback(interaction)
 
             # @everyone の connect が拒否される
-            interaction.channel.set_permissions.assert_any_await(
-                interaction.guild.default_role, connect=False
+            _assert_permission_field(
+                interaction.channel.set_permissions,
+                interaction.guild.default_role,
+                "connect",
+                False,
             )
             # DB に is_locked=True が書き込まれる
             mock_update.assert_awaited_once()
@@ -647,8 +740,11 @@ class TestLockButton:
             await view.lock_button.callback(interaction)
 
             # @everyone の権限上書きが削除される
-            interaction.channel.set_permissions.assert_any_await(
-                interaction.guild.default_role, overwrite=None
+            _assert_permission_field(
+                interaction.channel.set_permissions,
+                interaction.guild.default_role,
+                "connect",
+                None,
             )
             mock_update.assert_awaited_once()
             assert mock_update.call_args[1]["is_locked"] is False
@@ -684,8 +780,11 @@ class TestHideButton:
             button = view.hide_button
             await view.hide_button.callback(interaction)
 
-            interaction.channel.set_permissions.assert_any_await(
-                interaction.guild.default_role, view_channel=False
+            _assert_permission_field(
+                interaction.channel.set_permissions,
+                interaction.guild.default_role,
+                "view_channel",
+                False,
             )
             mock_update.assert_awaited_once()
             assert mock_update.call_args[1]["is_hidden"] is True
@@ -717,8 +816,11 @@ class TestHideButton:
             button = view.hide_button
             await view.hide_button.callback(interaction)
 
-            interaction.channel.set_permissions.assert_any_await(
-                interaction.guild.default_role, view_channel=None
+            _assert_permission_field(
+                interaction.channel.set_permissions,
+                interaction.guild.default_role,
+                "view_channel",
+                None,
             )
             mock_update.assert_awaited_once()
             assert mock_update.call_args[1]["is_hidden"] is False
@@ -1604,7 +1706,8 @@ class TestRepostPanel:
         channel.pins = AsyncMock(return_value=[old_msg])
 
         # 新パネル送信
-        channel.send = AsyncMock(return_value=MagicMock())
+        new_msg = MagicMock(pin=AsyncMock())
+        channel.send = AsyncMock(return_value=new_msg)
 
         voice_session = _make_voice_session(owner_id="1")
         bot = MagicMock()
@@ -1625,6 +1728,7 @@ class TestRepostPanel:
         old_msg.delete.assert_awaited_once()
         # 新パネル送信
         channel.send.assert_awaited_once()
+        new_msg.pin.assert_awaited_once()
         kwargs = channel.send.call_args[1]
         assert "embed" in kwargs
         assert "view" in kwargs
@@ -1686,7 +1790,7 @@ class TestRepostPanel:
         # ピンが空、履歴も空
         channel.pins = AsyncMock(return_value=[])
         channel.history = MagicMock(return_value=_AsyncIter([]))
-        channel.send = AsyncMock(return_value=MagicMock())
+        channel.send = AsyncMock(return_value=MagicMock(pin=AsyncMock()))
 
         voice_session = _make_voice_session(owner_id="1")
         bot = MagicMock()
@@ -1716,7 +1820,7 @@ class TestRepostPanel:
         owner = MagicMock(spec=discord.Member)
         channel.guild.get_member = MagicMock(return_value=owner)
 
-        channel.send = AsyncMock(return_value=MagicMock())
+        channel.send = AsyncMock(return_value=MagicMock(pin=AsyncMock()))
 
         voice_session = _make_voice_session(owner_id="1")
         bot = MagicMock()
@@ -1766,7 +1870,7 @@ class TestRepostPanel:
         channel.pins = AsyncMock(return_value=[other_bot_msg, user_msg])
         # 履歴にも同じメッセージ (パネルではない)
         channel.history = MagicMock(return_value=_AsyncIter([other_bot_msg, user_msg]))
-        channel.send = AsyncMock(return_value=MagicMock())
+        channel.send = AsyncMock(return_value=MagicMock(pin=AsyncMock()))
 
         voice_session = _make_voice_session(owner_id="1")
         bot = MagicMock()
@@ -1798,7 +1902,7 @@ class TestRepostPanel:
         channel.guild.get_member = MagicMock(return_value=owner)
         channel.pins = AsyncMock(return_value=[])
         channel.history = MagicMock(return_value=_AsyncIter([]))
-        channel.send = AsyncMock(return_value=MagicMock())
+        channel.send = AsyncMock(return_value=MagicMock(pin=AsyncMock()))
 
         voice_session = _make_voice_session(
             owner_id="1", is_locked=True, is_hidden=True
@@ -1844,7 +1948,7 @@ class TestRepostPanel:
         old_msg.delete = AsyncMock()
         channel.history = MagicMock(return_value=_AsyncIter([old_msg]))
 
-        channel.send = AsyncMock(return_value=MagicMock())
+        channel.send = AsyncMock(return_value=MagicMock(pin=AsyncMock()))
 
         voice_session = _make_voice_session(owner_id="1")
         bot = MagicMock()
@@ -2152,7 +2256,12 @@ class TestBlockSelectCallback:
 
         await select.callback(interaction)
 
-        channel.set_permissions.assert_awaited_once_with(user_to_block, connect=False)
+        _assert_permission_field(
+            channel.set_permissions,
+            user_to_block,
+            "connect",
+            False,
+        )
         # VC にいるのでキックもされる
         user_to_block.move_to.assert_awaited_once_with(None)
         # セレクトメニューを非表示にする
@@ -2206,7 +2315,12 @@ class TestBlockSelectCallback:
 
         await select.callback(interaction)
 
-        channel.set_permissions.assert_awaited_once_with(user_to_block, connect=False)
+        _assert_permission_field(
+            channel.set_permissions,
+            user_to_block,
+            "connect",
+            False,
+        )
         # VC にいないのでキックされない
         user_to_block.move_to.assert_not_awaited()
         interaction.response.edit_message.assert_awaited_once()
@@ -2264,7 +2378,12 @@ class TestAllowSelectCallback:
 
         await select.callback(interaction)
 
-        channel.set_permissions.assert_awaited_once_with(user_to_allow, connect=True)
+        _assert_permission_field(
+            channel.set_permissions,
+            user_to_allow,
+            "connect",
+            True,
+        )
         # セレクトメニューを非表示にする
         interaction.response.edit_message.assert_awaited_once()
         assert interaction.response.edit_message.call_args[1]["content"] == "\u200b"
@@ -2377,15 +2496,14 @@ class TestLockButtonOwnerPermissions:
             await view.lock_button.callback(interaction)
 
         # オーナーにフル権限が付与される (guild.get_member で取得したオーナー)
-        interaction.channel.set_permissions.assert_any_await(
-            owner,
-            connect=True,
-            speak=True,
-            stream=True,
-            move_members=True,
-            mute_members=True,
-            deafen_members=True,
-        )
+        call = _permission_call_for(interaction.channel.set_permissions, owner)
+        overwrite = call.kwargs["overwrite"]
+        assert overwrite.connect is True
+        assert overwrite.speak is True
+        assert overwrite.stream is True
+        assert overwrite.move_members is True
+        assert overwrite.mute_members is True
+        assert overwrite.deafen_members is True
 
     async def test_lock_skips_owner_permissions_when_not_found(self) -> None:
         """guild.get_member が None を返す場合、オーナー権限付与をスキップ。"""
@@ -2420,8 +2538,11 @@ class TestLockButtonOwnerPermissions:
 
         # @everyone の権限のみ設定される (オーナー権限はスキップ)
         assert interaction.channel.set_permissions.await_count == 1
-        interaction.channel.set_permissions.assert_awaited_once_with(
-            interaction.guild.default_role, connect=False
+        _assert_permission_field(
+            interaction.channel.set_permissions,
+            interaction.guild.default_role,
+            "connect",
+            False,
         )
 
     async def test_lock_also_denies_role_permissions(self) -> None:
@@ -2457,7 +2578,12 @@ class TestLockButtonOwnerPermissions:
             await view.lock_button.callback(interaction)
 
         # ロールの connect も拒否される
-        interaction.channel.set_permissions.assert_any_await(role, connect=False)
+        _assert_permission_field(
+            interaction.channel.set_permissions,
+            role,
+            "connect",
+            False,
+        )
 
     async def test_unlock_restores_role_permissions(self) -> None:
         """アンロック時にロールの connect 拒否が解除される。"""
@@ -2493,7 +2619,12 @@ class TestLockButtonOwnerPermissions:
             await view.lock_button.callback(interaction)
 
         # ロールの connect 拒否が解除される (connect=None)
-        interaction.channel.set_permissions.assert_any_await(role, connect=None)
+        _assert_permission_field(
+            interaction.channel.set_permissions,
+            role,
+            "connect",
+            None,
+        )
 
 
 # ===========================================================================
@@ -2596,7 +2727,12 @@ class TestCameraToggleSelectCallback:
         await select.callback(interaction)
 
         # 許可 → 禁止
-        interaction.channel.set_permissions.assert_awaited_once_with(user, stream=False)
+        _assert_permission_field(
+            interaction.channel.set_permissions,
+            user,
+            "stream",
+            False,
+        )
         interaction.response.edit_message.assert_awaited_once()
         assert interaction.response.edit_message.call_args[1]["content"] == "\u200b"
         interaction.channel.send.assert_awaited_once()
@@ -2631,7 +2767,12 @@ class TestCameraToggleSelectCallback:
         await select.callback(interaction)
 
         # 禁止 → 許可 (None に戻す)
-        interaction.channel.set_permissions.assert_awaited_once_with(user, stream=None)
+        _assert_permission_field(
+            interaction.channel.set_permissions,
+            user,
+            "stream",
+            None,
+        )
         interaction.response.edit_message.assert_awaited_once()
         interaction.channel.send.assert_awaited_once()
         msg = interaction.channel.send.call_args[0][0]
@@ -3067,14 +3208,18 @@ class TestTransferSelectMenuPermissionMigration:
             await menu.callback(interaction)
 
         # 旧オーナーの権限が削除される
-        interaction.channel.set_permissions.assert_any_await(
+        _assert_permission_field(
+            interaction.channel.set_permissions,
             interaction.user,
-            read_message_history=None,
+            "read_message_history",
+            None,
         )
         # 新オーナーに権限が付与される
-        interaction.channel.set_permissions.assert_any_await(
+        _assert_permission_field(
+            interaction.channel.set_permissions,
             new_owner,
-            read_message_history=True,
+            "read_message_history",
+            True,
         )
 
     async def test_permission_migration_with_non_member_user(self) -> None:
@@ -3117,9 +3262,11 @@ class TestTransferSelectMenuPermissionMigration:
 
         # 新オーナーに権限が付与される (これだけ)
         assert interaction.channel.set_permissions.await_count == 1
-        interaction.channel.set_permissions.assert_awaited_once_with(
+        _assert_permission_field(
+            interaction.channel.set_permissions,
             new_owner,
-            read_message_history=True,
+            "read_message_history",
+            True,
         )
 
 
