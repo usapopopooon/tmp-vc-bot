@@ -17,6 +17,9 @@ from __future__ import annotations
 import contextlib
 import logging
 import time
+import unicodedata
+from dataclasses import dataclass
+from typing import Any
 
 import discord
 from discord import app_commands
@@ -79,6 +82,44 @@ DEFAULT_RTC_REGION = "japan"
 VC_CREATE_COOLDOWN_SECONDS = 30
 
 logger = logging.getLogger(__name__)
+
+_LEGACY_LOBBY_NAME = "➕ 新規VC作成"
+_DIALOG_DEFAULT_LOBBY_NAME = "作業空間作成"
+_DIALOG_DEFAULT_ROOM_PREFIX = "作業空間"
+
+_FEATURE_OVERRIDE_FIELDS = (
+    "allow_rename",
+    "allow_limit",
+    "allow_bitrate",
+    "allow_region",
+    "allow_lock",
+    "allow_hide",
+    "allow_nsfw",
+    "allow_transfer",
+    "allow_kick",
+    "allow_dissolve",
+    "allow_block",
+    "allow_allow",
+    "allow_camera",
+)
+
+
+@dataclass(frozen=True)
+class LobbyCreateConfig:
+    """ロビー作成に使う設定値。slash command と Modal で共有する。"""
+
+    lobby_name: str
+    naming_mode: str
+    room_prefix: str | None
+    number_style: str
+    number_match_mode: str
+    start_number: int
+    owner_mode: str
+    control_policy: str
+    feature_preset: str
+    default_user_limit: int
+    feature_overrides: dict[str, bool | None]
+
 
 # ==========================================================================
 # VC 作成クールダウン (連続作成防止)
@@ -247,7 +288,7 @@ def _is_legacy_lobby_request(
 ) -> bool:
     """引数なし相当の従来ロビー作成かどうかを判定する。"""
     return (
-        lobby_name == "➕ 新規VC作成"
+        lobby_name == _LEGACY_LOBBY_NAME
         and naming_mode == LOBBY_NAMING_PERSONAL
         and room_prefix is None
         and number_style == NUMBER_STYLE_HALF
@@ -271,6 +312,73 @@ def _resolve_feature_flags(
         if value is not None:
             flags[field] = value
     return flags
+
+
+def _empty_feature_overrides() -> dict[str, bool | None]:
+    """機能の個別上書きなしを表す辞書を返す。"""
+    overrides: dict[str, bool | None] = {}
+    for field in _FEATURE_OVERRIDE_FIELDS:
+        overrides[field] = None
+    return overrides
+
+
+def _normalize_modal_text(value: object) -> str:
+    """Modal 入力を NFKC 正規化し、前後空白を除去する。"""
+    return unicodedata.normalize("NFKC", str(value)).strip()
+
+
+def _parse_modal_start_number(value: object) -> int:
+    """Modal の開始番号を 1 以上の整数として読む。"""
+    text = _normalize_modal_text(value)
+    try:
+        number = int(text)
+    except ValueError:
+        msg = "開始番号は数字で入力してください。"
+        raise ValueError(msg) from None
+    if number < 1:
+        msg = "開始番号は 1 以上で入力してください。"
+        raise ValueError(msg)
+    return number
+
+
+def _parse_modal_number_style(value: object) -> str:
+    """Modal の数字形式入力を内部値へ変換する。"""
+    text = _normalize_modal_text(value).lower()
+    if text in {"半角", "hankaku", "half"}:
+        return NUMBER_STYLE_HALF
+    if text in {"全角", "zenkaku", "full"}:
+        return NUMBER_STYLE_FULL
+    msg = "数字形式は「半角」または「全角」で入力してください。"
+    raise ValueError(msg)
+
+
+def _parse_modal_feature_preset(value: object) -> str:
+    """Modal の機能プリセット入力を内部値へ変換する。"""
+    text = _normalize_modal_text(value).lower()
+    if text in {"人数のみ", "人数", "limit", "limit_only"}:
+        return FEATURE_PRESET_LIMIT_ONLY
+    if text in {"全機能", "全部", "full"}:
+        return FEATURE_PRESET_FULL
+    msg = "機能は「人数のみ」または「全機能」で入力してください。"
+    raise ValueError(msg)
+
+
+def _dialog_lobby_name(lobby_name: str) -> str:
+    """Dialog のロビー名デフォルトを返す。"""
+    if lobby_name == _LEGACY_LOBBY_NAME:
+        return _DIALOG_DEFAULT_LOBBY_NAME
+    return lobby_name
+
+
+def _dialog_room_prefix(lobby_name: str, room_prefix: str | None) -> str:
+    """Dialog の部屋名プレフィックスデフォルトを返す。"""
+    if room_prefix:
+        return room_prefix
+    if lobby_name != _LEGACY_LOBBY_NAME and lobby_name.endswith("作成"):
+        prefix = lobby_name.removesuffix("作成")
+        if prefix:
+            return prefix
+    return _DIALOG_DEFAULT_ROOM_PREFIX
 
 
 class VoiceCog(commands.Cog):
@@ -1200,6 +1308,198 @@ class VoiceCog(commands.Cog):
                 e,
             )
 
+    async def _create_lobby_from_config(
+        self,
+        interaction: discord.Interaction,
+        config: LobbyCreateConfig,
+    ) -> None:
+        """ロビー作成設定から VC と DB レコードを作成する。"""
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "このコマンドはサーバー内でのみ使用できます。", ephemeral=True
+            )
+            return
+
+        # インタラクションを即座に確認 (複数インスタンス実行時の重複防止)
+        # Discord は1つのインタラクションに対して1回しか応答を許可しないため、
+        # 先に defer() した方だけが処理を続行できる
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except (discord.HTTPException, discord.InteractionResponded):
+            return
+
+        lobby_name = config.lobby_name.strip()
+        room_prefix = config.room_prefix.strip() if config.room_prefix else None
+        owner_mode = config.owner_mode
+        control_policy = config.control_policy
+
+        if not lobby_name:
+            await interaction.followup.send(
+                "ロビー名を入力してください。",
+                ephemeral=True,
+            )
+            return
+        if len(lobby_name) > 100:
+            await interaction.followup.send(
+                "ロビー名は 100 文字以内で入力してください。",
+                ephemeral=True,
+            )
+            return
+        if config.default_user_limit < 0 or config.default_user_limit > 99:
+            await interaction.followup.send(
+                "デフォルト人数制限は 0〜99 の範囲で指定してください。",
+                ephemeral=True,
+            )
+            return
+        if config.start_number < 1:
+            await interaction.followup.send(
+                "開始番号は 1 以上で指定してください。",
+                ephemeral=True,
+            )
+            return
+        if config.naming_mode == LOBBY_NAMING_NUMBERED and not room_prefix:
+            await interaction.followup.send(
+                "連番ロビーでは room_prefix を指定してください。",
+                ephemeral=True,
+            )
+            return
+        if config.naming_mode == LOBBY_NAMING_NUMBERED and room_prefix:
+            first_room_name = room_prefix + format_sequence_number(
+                config.start_number, config.number_style
+            )
+            if len(first_room_name) > 100:
+                await interaction.followup.send(
+                    "作成される VC 名は 100 文字以内にしてください。",
+                    ephemeral=True,
+                )
+                return
+
+        if (
+            owner_mode == LOBBY_OWNER_MODE_NONE
+            and control_policy == LOBBY_CONTROL_OWNER
+        ):
+            control_policy = LOBBY_CONTROL_MEMBERS
+
+        feature_flags = _resolve_feature_flags(
+            config.feature_preset,
+            config.feature_overrides,
+        )
+        if owner_mode == LOBBY_OWNER_MODE_NONE:
+            feature_flags["allow_transfer"] = False
+
+        is_legacy_request = _is_legacy_lobby_request(
+            lobby_name=lobby_name,
+            naming_mode=config.naming_mode,
+            room_prefix=room_prefix,
+            number_style=config.number_style,
+            number_match_mode=config.number_match_mode,
+            start_number=config.start_number,
+            owner_mode=owner_mode,
+            control_policy=control_policy,
+            feature_preset=config.feature_preset,
+            default_user_limit=config.default_user_limit,
+            feature_overrides=config.feature_overrides,
+        )
+
+        guild_id = str(interaction.guild_id)
+        # ギルド単位のロックで重複作成を防止
+        async with get_resource_lock(f"lobby_create:{guild_id}"):
+            # --- 重複チェック ---
+            # 引数なしの従来ロビー作成だけは後方互換として 1 サーバー 1 件を維持。
+            # 設定付きロビーは通常ロビーと併存できる。
+            async with async_session() as session:
+                if is_legacy_request:
+                    existing = await get_lobbies_by_guild(session, guild_id)
+                    for lobby in existing:
+                        channel = interaction.guild.get_channel(
+                            int(lobby.lobby_channel_id)
+                        )
+                        if channel is not None:
+                            await interaction.followup.send(
+                                "このサーバーには既にロビーが存在します。",
+                                ephemeral=True,
+                            )
+                            return
+                        # チャンネルが削除済み → 孤立レコードを掃除
+                        await delete_lobby(session, lobby.id)
+                        if self._lobby_channel_ids is not None:
+                            self._lobby_channel_ids.discard(lobby.lobby_channel_id)
+
+            # --- VC の作成 ---
+            try:
+                lobby_channel = await interaction.guild.create_voice_channel(
+                    name=lobby_name,
+                    rtc_region=DEFAULT_RTC_REGION,
+                )
+            except discord.HTTPException as e:
+                await interaction.followup.send(
+                    f"VCの作成に失敗しました: {e}", ephemeral=True
+                )
+                return
+
+            # --- DB にロビーとして登録 ---
+            lobby_channel_id_str = str(lobby_channel.id)
+            try:
+                async with async_session() as session:
+                    if is_legacy_request:
+                        await create_lobby(
+                            session,
+                            guild_id=guild_id,
+                            lobby_channel_id=lobby_channel_id_str,
+                            category_id=None,
+                            default_user_limit=0,
+                        )
+                    else:
+                        await create_lobby(
+                            session,
+                            guild_id=guild_id,
+                            lobby_channel_id=lobby_channel_id_str,
+                            category_id=None,
+                            default_user_limit=config.default_user_limit,
+                            naming_mode=config.naming_mode,
+                            room_prefix=room_prefix,
+                            number_style=config.number_style,
+                            number_match_mode=config.number_match_mode,
+                            start_number=config.start_number,
+                            owner_mode=owner_mode,
+                            control_policy=control_policy,
+                            **feature_flags,
+                        )
+            except Exception:
+                logger.exception(
+                    "Failed to register lobby channel %s in database",
+                    lobby_channel.id,
+                )
+                try:
+                    await lobby_channel.delete()
+                except discord.HTTPException as e:
+                    logger.warning(
+                        "Failed to delete lobby channel %s after DB error: %s",
+                        lobby_channel.id,
+                        e,
+                    )
+                    await interaction.followup.send(
+                        "ロビーの登録に失敗しました。"
+                        "作成した VC の削除にも失敗したため、手動で削除してください。",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.followup.send(
+                        "ロビーの登録に失敗したため、作成した VC を削除しました。",
+                        ephemeral=True,
+                    )
+                return
+
+            # キャッシュに追加
+            if self._lobby_channel_ids is not None:
+                self._lobby_channel_ids.add(lobby_channel_id_str)
+
+        await interaction.followup.send(
+            f"ロビー **{lobby_channel.name}** を作成しました！\n"
+            f"お好みのカテゴリに手動で移動してください。",
+            ephemeral=True,
+        )
+
     # ==========================================================================
     # スラッシュコマンド (/vc グループ)
     # ==========================================================================
@@ -1210,6 +1510,7 @@ class VoiceCog(commands.Cog):
     )
 
     @vc_group.command(name="lobby", description="ロビーVCを作成します")
+    @app_commands.describe(dialog="連番共有ロビーをダイアログで設定します")
     @app_commands.choices(
         naming_mode=[
             app_commands.Choice(name="個人名", value=LOBBY_NAMING_PERSONAL),
@@ -1242,7 +1543,8 @@ class VoiceCog(commands.Cog):
     async def vc_lobby(
         self,
         interaction: discord.Interaction,
-        lobby_name: str = "➕ 新規VC作成",
+        dialog: bool = False,
+        lobby_name: str = _LEGACY_LOBBY_NAME,
         naming_mode: str = LOBBY_NAMING_PERSONAL,
         room_prefix: str | None = None,
         number_style: str = NUMBER_STYLE_HALF,
@@ -1282,15 +1584,19 @@ class VoiceCog(commands.Cog):
             )
             return
 
-        # インタラクションを即座に確認 (複数インスタンス実行時の重複防止)
-        # Discord は1つのインタラクションに対して1回しか応答を許可しないため、
-        # 先に defer() した方だけが処理を続行できる
-        try:
-            await interaction.response.defer(ephemeral=True)
-        except (discord.HTTPException, discord.InteractionResponded):
+        if dialog:
+            await interaction.response.send_modal(
+                NumberedLobbyModal(
+                    self,
+                    lobby_name=_dialog_lobby_name(lobby_name),
+                    room_prefix=_dialog_room_prefix(lobby_name, room_prefix),
+                    start_number=start_number,
+                    number_style=number_style,
+                    feature_preset=FEATURE_PRESET_LIMIT_ONLY,
+                )
+            )
             return
 
-        guild_id = str(interaction.guild_id)
         feature_overrides = {
             "allow_rename": allow_rename,
             "allow_limit": allow_limit,
@@ -1306,121 +1612,21 @@ class VoiceCog(commands.Cog):
             "allow_allow": allow_connect,
             "allow_camera": allow_camera,
         }
-
-        if default_user_limit < 0 or default_user_limit > 99:
-            await interaction.followup.send(
-                "デフォルト人数制限は 0〜99 の範囲で指定してください。",
-                ephemeral=True,
-            )
-            return
-        if start_number < 1:
-            await interaction.followup.send(
-                "開始番号は 1 以上で指定してください。",
-                ephemeral=True,
-            )
-            return
-        if naming_mode == LOBBY_NAMING_NUMBERED and not room_prefix:
-            await interaction.followup.send(
-                "連番ロビーでは room_prefix を指定してください。",
-                ephemeral=True,
-            )
-            return
-
-        if (
-            owner_mode == LOBBY_OWNER_MODE_NONE
-            and control_policy == LOBBY_CONTROL_OWNER
-        ):
-            control_policy = LOBBY_CONTROL_MEMBERS
-
-        feature_flags = _resolve_feature_flags(feature_preset, feature_overrides)
-        if owner_mode == LOBBY_OWNER_MODE_NONE:
-            feature_flags["allow_transfer"] = False
-
-        is_legacy_request = _is_legacy_lobby_request(
-            lobby_name=lobby_name,
-            naming_mode=naming_mode,
-            room_prefix=room_prefix,
-            number_style=number_style,
-            number_match_mode=number_match_mode,
-            start_number=start_number,
-            owner_mode=owner_mode,
-            control_policy=control_policy,
-            feature_preset=feature_preset,
-            default_user_limit=default_user_limit,
-            feature_overrides=feature_overrides,
-        )
-
-        # ギルド単位のロックで重複作成を防止
-        async with get_resource_lock(f"lobby_create:{guild_id}"):
-            # --- 重複チェック ---
-            # 引数なしの従来ロビー作成だけは後方互換として 1 サーバー 1 件を維持。
-            # 設定付きロビーは通常ロビーと併存できる。
-            async with async_session() as session:
-                if is_legacy_request:
-                    existing = await get_lobbies_by_guild(session, guild_id)
-                    for lobby in existing:
-                        channel = interaction.guild.get_channel(
-                            int(lobby.lobby_channel_id)
-                        )
-                        if channel is not None:
-                            await interaction.followup.send(
-                                "このサーバーには既にロビーが存在します。",
-                                ephemeral=True,
-                            )
-                            return
-                        # チャンネルが削除済み → 孤立レコードを掃除
-                        await delete_lobby(session, lobby.id)
-                        if self._lobby_channel_ids is not None:
-                            self._lobby_channel_ids.discard(lobby.lobby_channel_id)
-
-            # --- VC の作成 ---
-            try:
-                lobby_channel = await interaction.guild.create_voice_channel(
-                    name=lobby_name,
-                    rtc_region=DEFAULT_RTC_REGION,
-                )
-            except discord.HTTPException as e:
-                await interaction.followup.send(
-                    f"VCの作成に失敗しました: {e}", ephemeral=True
-                )
-                return
-
-            # --- DB にロビーとして登録 ---
-            lobby_channel_id_str = str(lobby_channel.id)
-            async with async_session() as session:
-                if is_legacy_request:
-                    await create_lobby(
-                        session,
-                        guild_id=guild_id,
-                        lobby_channel_id=lobby_channel_id_str,
-                        category_id=None,
-                        default_user_limit=0,
-                    )
-                else:
-                    await create_lobby(
-                        session,
-                        guild_id=guild_id,
-                        lobby_channel_id=lobby_channel_id_str,
-                        category_id=None,
-                        default_user_limit=default_user_limit,
-                        naming_mode=naming_mode,
-                        room_prefix=room_prefix,
-                        number_style=number_style,
-                        number_match_mode=number_match_mode,
-                        start_number=start_number,
-                        owner_mode=owner_mode,
-                        control_policy=control_policy,
-                        **feature_flags,
-                    )
-
-            # キャッシュに追加
-            if self._lobby_channel_ids is not None:
-                self._lobby_channel_ids.add(lobby_channel_id_str)
-
-        await interaction.followup.send(
-            f"ロビー **{lobby_channel.name}** を作成しました！\n"
-            f"お好みのカテゴリに手動で移動してください。",
-            ephemeral=True,
+        await self._create_lobby_from_config(
+            interaction,
+            LobbyCreateConfig(
+                lobby_name=lobby_name,
+                naming_mode=naming_mode,
+                room_prefix=room_prefix,
+                number_style=number_style,
+                number_match_mode=number_match_mode,
+                start_number=start_number,
+                owner_mode=owner_mode,
+                control_policy=control_policy,
+                feature_preset=feature_preset,
+                default_user_limit=default_user_limit,
+                feature_overrides=feature_overrides,
+            ),
         )
 
     @vc_group.command(name="panel", description="コントロールパネルを再投稿します")
@@ -1464,6 +1670,109 @@ class VoiceCog(commands.Cog):
             )
             return
         raise error
+
+
+class NumberedLobbyModal(discord.ui.Modal):
+    """連番共有ロビーを短い入力フォームで作成する Modal。"""
+
+    def __init__(
+        self,
+        cog: VoiceCog,
+        *,
+        lobby_name: str,
+        room_prefix: str,
+        start_number: int,
+        number_style: str,
+        feature_preset: str,
+    ) -> None:
+        super().__init__(title="連番ロビー作成")
+        self.cog = cog
+
+        number_style_label = "全角" if number_style == NUMBER_STYLE_FULL else "半角"
+        feature_preset_label = (
+            "人数のみ" if feature_preset == FEATURE_PRESET_LIMIT_ONLY else "全機能"
+        )
+
+        self.lobby_name_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
+            label="ロビーVC名",
+            default=lobby_name,
+            placeholder="例: ⌛️もくもく空間作成",
+            max_length=100,
+        )
+        self.room_prefix_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
+            label="作成VC名の前半",
+            default=room_prefix,
+            placeholder="例: ⌛️もくもく空間",
+            max_length=95,
+        )
+        self.start_number_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
+            label="開始番号",
+            default=str(start_number),
+            placeholder="例: 2",
+            max_length=10,
+        )
+        self.number_style_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
+            label="数字形式",
+            default=number_style_label,
+            placeholder="半角 / 全角",
+            max_length=10,
+        )
+        self.feature_preset_input: discord.ui.TextInput[Any] = discord.ui.TextInput(
+            label="変更可能な機能",
+            default=feature_preset_label,
+            placeholder="人数のみ / 全機能",
+            max_length=20,
+        )
+
+        self.add_item(self.lobby_name_input)
+        self.add_item(self.room_prefix_input)
+        self.add_item(self.start_number_input)
+        self.add_item(self.number_style_input)
+        self.add_item(self.feature_preset_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        """Modal 入力をロビー作成設定に変換して作成する。"""
+        lobby_name = str(self.lobby_name_input.value).strip()
+        room_prefix = str(self.room_prefix_input.value).strip()
+        if not lobby_name:
+            await interaction.response.send_message(
+                "ロビー名を入力してください。",
+                ephemeral=True,
+            )
+            return
+        if not room_prefix:
+            await interaction.response.send_message(
+                "作成VC名の前半を入力してください。",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            start_number = _parse_modal_start_number(self.start_number_input.value)
+            number_style = _parse_modal_number_style(self.number_style_input.value)
+            feature_preset = _parse_modal_feature_preset(
+                self.feature_preset_input.value
+            )
+        except ValueError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
+        await self.cog._create_lobby_from_config(
+            interaction,
+            LobbyCreateConfig(
+                lobby_name=lobby_name,
+                naming_mode=LOBBY_NAMING_NUMBERED,
+                room_prefix=room_prefix,
+                number_style=number_style,
+                number_match_mode=NUMBER_MATCH_BOTH,
+                start_number=start_number,
+                owner_mode=LOBBY_OWNER_MODE_NONE,
+                control_policy=LOBBY_CONTROL_MEMBERS,
+                feature_preset=feature_preset,
+                default_user_limit=0,
+                feature_overrides=_empty_feature_overrides(),
+            ),
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

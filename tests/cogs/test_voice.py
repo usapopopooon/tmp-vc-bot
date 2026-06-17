@@ -12,6 +12,7 @@ from discord import app_commands
 
 from src.cogs.voice import (
     VC_CREATE_COOLDOWN_SECONDS,
+    NumberedLobbyModal,
     VoiceCog,
     _cleanup_vc_create_cooldown_cache,
     _vc_create_cooldown_cache,
@@ -1638,6 +1639,141 @@ class TestVcLobbyCommand:
         assert kwargs["allow_rename"] is False
         assert kwargs["allow_transfer"] is False
 
+    async def test_dialog_option_opens_numbered_lobby_modal(self) -> None:
+        """dialog=True では即作成せず連番ロビー作成 Modal を開く。"""
+        cog = _make_cog()
+        interaction = _make_interaction(1)
+        interaction.response.send_modal = AsyncMock()
+
+        await cog.vc_lobby.callback(
+            cog,
+            interaction,
+            dialog=True,
+            lobby_name="⌛️もくもく空間作成",
+            start_number=2,
+            number_style="full",
+            feature_preset="limit_only",
+        )
+
+        interaction.response.send_modal.assert_awaited_once()
+        modal = interaction.response.send_modal.call_args.args[0]
+        assert isinstance(modal, NumberedLobbyModal)
+        assert modal.lobby_name_input.default == "⌛️もくもく空間作成"
+        assert modal.room_prefix_input.default == "⌛️もくもく空間"
+        assert modal.start_number_input.default == "2"
+        assert modal.number_style_input.default == "全角"
+        assert modal.feature_preset_input.default == "人数のみ"
+        interaction.response.defer.assert_not_awaited()
+        interaction.guild.create_voice_channel.assert_not_awaited()
+
+    async def test_numbered_lobby_modal_submit_creates_limit_only_lobby(self) -> None:
+        """Modal submit でオーナーなし/人数のみ/全角連番ロビーを作成する。"""
+        cog = _make_cog()
+        modal = NumberedLobbyModal(
+            cog,
+            lobby_name="作業空間作成",
+            room_prefix="作業空間",
+            start_number=1,
+            number_style="half",
+            feature_preset="limit_only",
+        )
+        modal.lobby_name_input = MagicMock()
+        modal.lobby_name_input.value = "⌛️もくもく空間作成"
+        modal.room_prefix_input = MagicMock()
+        modal.room_prefix_input.value = "⌛️もくもく空間"
+        modal.start_number_input = MagicMock()
+        modal.start_number_input.value = "２"
+        modal.number_style_input = MagicMock()
+        modal.number_style_input.value = "全角"
+        modal.feature_preset_input = MagicMock()
+        modal.feature_preset_input.value = "人数のみ"
+
+        interaction = _make_interaction(1)
+        lobby_channel = MagicMock(spec=discord.VoiceChannel)
+        lobby_channel.id = 502
+        lobby_channel.name = "⌛️もくもく空間作成"
+        interaction.guild.create_voice_channel = AsyncMock(return_value=lobby_channel)
+
+        mock_factory, mock_session = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch("src.cogs.voice.create_lobby", new_callable=AsyncMock) as mock_create,
+        ):
+            await modal.on_submit(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        interaction.guild.create_voice_channel.assert_awaited_once_with(
+            name="⌛️もくもく空間作成",
+            rtc_region="japan",
+        )
+        mock_create.assert_awaited_once()
+        kwargs = mock_create.call_args.kwargs
+        assert mock_create.call_args.args[0] is mock_session
+        assert kwargs["guild_id"] == str(interaction.guild_id)
+        assert kwargs["lobby_channel_id"] == "502"
+        assert kwargs["naming_mode"] == "numbered"
+        assert kwargs["room_prefix"] == "⌛️もくもく空間"
+        assert kwargs["number_style"] == "full"
+        assert kwargs["number_match_mode"] == "both"
+        assert kwargs["start_number"] == 2
+        assert kwargs["owner_mode"] == "none"
+        assert kwargs["control_policy"] == "members"
+        assert kwargs["allow_limit"] is True
+        assert kwargs["allow_rename"] is False
+        assert kwargs["allow_transfer"] is False
+
+    async def test_numbered_lobby_modal_rejects_invalid_number_style(self) -> None:
+        """Modal の数字形式入力が不正なら作成前に弾く。"""
+        cog = _make_cog()
+        modal = NumberedLobbyModal(
+            cog,
+            lobby_name="作業空間作成",
+            room_prefix="作業空間",
+            start_number=1,
+            number_style="half",
+            feature_preset="limit_only",
+        )
+        modal.lobby_name_input = MagicMock()
+        modal.lobby_name_input.value = "作業空間作成"
+        modal.room_prefix_input = MagicMock()
+        modal.room_prefix_input.value = "作業空間"
+        modal.start_number_input = MagicMock()
+        modal.start_number_input.value = "2"
+        modal.number_style_input = MagicMock()
+        modal.number_style_input.value = "漢数字"
+        modal.feature_preset_input = MagicMock()
+        modal.feature_preset_input.value = "人数のみ"
+
+        interaction = _make_interaction(1)
+
+        await modal.on_submit(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        msg = interaction.response.send_message.call_args.args[0]
+        assert "数字形式" in msg
+        interaction.response.defer.assert_not_awaited()
+        interaction.guild.create_voice_channel.assert_not_awaited()
+
+    async def test_numbered_lobby_rejects_too_long_generated_room_name(self) -> None:
+        """作成される連番 VC 名が長すぎる場合はロビー作成前に弾く。"""
+        cog = _make_cog()
+        interaction = _make_interaction(1)
+
+        await cog.vc_lobby.callback(
+            cog,
+            interaction,
+            lobby_name="長すぎる部屋作成",
+            naming_mode="numbered",
+            room_prefix="あ" * 100,
+            start_number=1,
+        )
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        interaction.guild.create_voice_channel.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once()
+        msg = interaction.followup.send.call_args.args[0]
+        assert "100 文字以内" in msg
+
     async def test_rejects_dm(self) -> None:
         """DM からの実行は拒否される。"""
         cog = _make_cog()
@@ -1726,6 +1862,72 @@ class TestVcLobbyCommand:
         ):
             await cog.vc_lobby.callback(cog, interaction)
             mock_create.assert_not_awaited()
+
+    async def test_lobby_channel_deleted_on_db_registration_failure(self) -> None:
+        """DB 登録失敗時は作成済みロビー VC を削除する。"""
+        cog = _make_cog()
+        interaction = _make_interaction(1)
+
+        lobby_channel = MagicMock(spec=discord.VoiceChannel)
+        lobby_channel.id = 500
+        lobby_channel.name = "➕ 新規VC作成"
+        lobby_channel.delete = AsyncMock()
+        interaction.guild.create_voice_channel = AsyncMock(return_value=lobby_channel)
+
+        mock_factory, _mock_session = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_lobbies_by_guild",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "src.cogs.voice.create_lobby",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("db failed"),
+            ),
+        ):
+            await cog.vc_lobby.callback(cog, interaction)
+
+        lobby_channel.delete.assert_awaited_once()
+        interaction.followup.send.assert_awaited_once()
+        msg = interaction.followup.send.call_args.args[0]
+        assert "登録に失敗" in msg
+
+    async def test_delete_failure_reported_on_db_registration_failure(self) -> None:
+        """DB 登録失敗後のロビー VC 削除失敗はユーザーに伝える。"""
+        cog = _make_cog()
+        interaction = _make_interaction(1)
+
+        lobby_channel = MagicMock(spec=discord.VoiceChannel)
+        lobby_channel.id = 500
+        lobby_channel.name = "➕ 新規VC作成"
+        lobby_channel.delete = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=500), "delete failed")
+        )
+        interaction.guild.create_voice_channel = AsyncMock(return_value=lobby_channel)
+
+        mock_factory, _mock_session = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_lobbies_by_guild",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "src.cogs.voice.create_lobby",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("db failed"),
+            ),
+        ):
+            await cog.vc_lobby.callback(cog, interaction)
+
+        lobby_channel.delete.assert_awaited_once()
+        interaction.followup.send.assert_awaited_once()
+        msg = interaction.followup.send.call_args.args[0]
+        assert "削除にも失敗" in msg
 
     async def test_lobby_channel_has_correct_name(self) -> None:
         """作成される VC の名前が「➕ 新規VC作成」。"""
