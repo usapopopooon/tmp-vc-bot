@@ -21,10 +21,32 @@ import time
 import discord
 from discord import app_commands
 from discord.ext import commands
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.lobby_config import (
+    FEATURE_PRESET_FULL,
+    FEATURE_PRESET_LIMIT_ONLY,
+    LOBBY_CONTROL_ADMINS,
+    LOBBY_CONTROL_MEMBERS,
+    LOBBY_CONTROL_OWNER,
+    LOBBY_NAMING_NUMBERED,
+    LOBBY_NAMING_PERSONAL,
+    LOBBY_OWNER_MODE_NONE,
+    LOBBY_OWNER_MODE_OWNER,
+    NUMBER_MATCH_BOTH,
+    NUMBER_MATCH_FULL,
+    NUMBER_MATCH_HALF,
+    NUMBER_STYLE_FULL,
+    NUMBER_STYLE_HALF,
+    feature_flags_for_preset,
+    format_sequence_number,
+    has_owner,
+    is_numbered_lobby,
+    parse_sequence_number,
+)
 from src.database.engine import async_session
-from src.database.models import VoiceSession
+from src.database.models import Lobby, VoiceSession
 from src.services.db_service import (
     add_voice_session_member,
     claim_event,
@@ -39,6 +61,7 @@ from src.services.db_service import (
     get_lobby_by_channel_id,
     get_voice_session,
     get_voice_session_members_ordered,
+    get_voice_sessions_by_lobby,
     remove_voice_session_member,
     update_voice_session,
 )
@@ -144,6 +167,110 @@ async def _update_permission_overwrite(
         await channel.set_permissions(target, overwrite=None)
     else:
         await channel.set_permissions(target, overwrite=overwrite)
+
+
+def _sequence_scan_channels(
+    guild: discord.Guild,
+    category: discord.CategoryChannel | None,
+) -> list[discord.VoiceChannel]:
+    """連番の既存使用状況を調べる対象チャンネルを返す。"""
+    if category is not None:
+        return list(category.voice_channels)
+    return list(guild.voice_channels)
+
+
+def _used_sequence_numbers(
+    lobby: Lobby,
+    channels: list[discord.VoiceChannel],
+    voice_sessions: list[VoiceSession],
+) -> set[int]:
+    """DB と Discord 上の実チャンネル名から使用済み連番を集める。"""
+    used = {
+        session.sequence_number
+        for session in voice_sessions
+        if session.sequence_number is not None
+    }
+    prefix = lobby.room_prefix or ""
+    for existing_channel in channels:
+        parsed = parse_sequence_number(
+            existing_channel.name,
+            prefix,
+            lobby.number_match_mode,
+        )
+        if parsed is not None:
+            used.add(parsed)
+    return used
+
+
+def _next_sequence_number(
+    lobby: Lobby,
+    channels: list[discord.VoiceChannel],
+    voice_sessions: list[VoiceSession],
+) -> int:
+    """空いている最小の連番を返す。"""
+    used = _used_sequence_numbers(lobby, channels, voice_sessions)
+    candidate = max(lobby.start_number, 1)
+    while candidate in used:
+        candidate += 1
+    return candidate
+
+
+def _voice_channel_name(
+    lobby: Lobby,
+    member: discord.Member,
+    sequence_number: int | None,
+) -> str:
+    """ロビー設定から作成する VC 名を決定する。"""
+    if is_numbered_lobby(lobby):
+        if sequence_number is None:
+            msg = "numbered lobby requires sequence_number"
+            raise ValueError(msg)
+        prefix = lobby.room_prefix or "作業空間"
+        suffix = format_sequence_number(sequence_number, lobby.number_style)
+        return f"{prefix}{suffix}"
+    return f"{member.display_name}'s channel"
+
+
+def _is_legacy_lobby_request(
+    *,
+    lobby_name: str,
+    naming_mode: str,
+    room_prefix: str | None,
+    number_style: str,
+    number_match_mode: str,
+    start_number: int,
+    owner_mode: str,
+    control_policy: str,
+    feature_preset: str,
+    default_user_limit: int,
+    feature_overrides: dict[str, bool | None],
+) -> bool:
+    """引数なし相当の従来ロビー作成かどうかを判定する。"""
+    return (
+        lobby_name == "➕ 新規VC作成"
+        and naming_mode == LOBBY_NAMING_PERSONAL
+        and room_prefix is None
+        and number_style == NUMBER_STYLE_HALF
+        and number_match_mode == NUMBER_MATCH_BOTH
+        and start_number == 1
+        and owner_mode == LOBBY_OWNER_MODE_OWNER
+        and control_policy == LOBBY_CONTROL_OWNER
+        and feature_preset == FEATURE_PRESET_FULL
+        and default_user_limit == 0
+        and all(value is None for value in feature_overrides.values())
+    )
+
+
+def _resolve_feature_flags(
+    feature_preset: str,
+    overrides: dict[str, bool | None],
+) -> dict[str, bool]:
+    """プリセットと個別指定からロビー機能フラグを決定する。"""
+    flags = feature_flags_for_preset(feature_preset)
+    for field, value in overrides.items():
+        if value is not None:
+            flags[field] = value
+    return flags
 
 
 class VoiceCog(commands.Cog):
@@ -391,7 +518,10 @@ class VoiceCog(commands.Cog):
             return None
         if member.guild_permissions.administrator:
             return None
-        if str(member.id) == voice_session.owner_id:
+        if (
+            voice_session.owner_id is not None
+            and str(member.id) == voice_session.owner_id
+        ):
             return None
 
         overwrites = channel.overwrites_for(member)
@@ -709,50 +839,116 @@ class VoiceCog(commands.Cog):
                 category = channel.category
 
             # --- VC の作成 ---
-            # チャンネル名は「ユーザー名's channel」形式
+            # チャンネル名はロビー設定から決定する。
             # ロビーチャンネルの権限設定をコピーして
             # @everyone の接続拒否などを引き継ぐ
             # 高速化のため set_permissions() の追加 API 呼び出しを避け、
-            # 作成時の overwrites に read_message_history の設定を織り込む。
-            channel_name = f"{member.display_name}'s channel"
-            overwrites = dict(channel.overwrites)
+            # オーナーありの場合だけテキストチャット権限をオーナー専用にする。
+            owner_id = str(member.id) if has_owner(lobby) else None
+            new_channel: discord.VoiceChannel | None = None
+            voice_session: VoiceSession | None = None
 
-            default_ow = _copy_overwrite(overwrites.get(guild.default_role))
-            default_ow.update(read_message_history=False)
-            overwrites[guild.default_role] = default_ow
+            async with get_resource_lock(f"lobby_sequence:{lobby.id}"):
+                for _attempt in range(5):
+                    sequence_number = None
+                    if is_numbered_lobby(lobby):
+                        active_sessions = await get_voice_sessions_by_lobby(
+                            session, lobby.id
+                        )
+                        sequence_number = _next_sequence_number(
+                            lobby,
+                            _sequence_scan_channels(guild, category),
+                            active_sessions,
+                        )
 
-            owner_ow = _copy_overwrite(overwrites.get(member))
-            owner_ow.update(read_message_history=True)
-            overwrites[member] = owner_ow
+                    channel_name = _voice_channel_name(lobby, member, sequence_number)
+                    overwrites = dict(channel.overwrites)
 
-            new_channel = await guild.create_voice_channel(
-                name=channel_name,
-                category=category,
-                user_limit=lobby.default_user_limit,
-                rtc_region=DEFAULT_RTC_REGION,  # リージョンを日本に固定
-                overwrites=overwrites,  # ロビー権限 + オーナー閲覧権限
-            )
+                    if owner_id is not None:
+                        default_ow = _copy_overwrite(overwrites.get(guild.default_role))
+                        default_ow.update(read_message_history=False)
+                        overwrites[guild.default_role] = default_ow
 
-            # --- DB にセッション記録 ---
-            # VC 作成に成功したら、DB にセッション情報を保存する。
-            # 失敗した場合は作成した VC を削除してクリーンアップ。
-            try:
-                voice_session = await create_voice_session(
-                    session,
-                    lobby_id=lobby.id,
-                    channel_id=str(new_channel.id),
-                    owner_id=str(member.id),
-                    name=channel_name,
-                )
-                # オーナーを最初のメンバーとして DB に登録
-                await add_voice_session_member(
-                    session, voice_session.id, str(member.id)
-                )
-                # VC 作成成功後、クールダウンを記録
-                record_vc_create_cooldown(member.id)
-            except Exception:
-                await new_channel.delete()
-                raise
+                        owner_ow = _copy_overwrite(overwrites.get(member))
+                        owner_ow.update(read_message_history=True)
+                        overwrites[member] = owner_ow
+
+                    new_channel = await guild.create_voice_channel(
+                        name=channel_name,
+                        category=category,
+                        user_limit=lobby.default_user_limit,
+                        rtc_region=DEFAULT_RTC_REGION,  # リージョンを日本に固定
+                        overwrites=overwrites,
+                    )
+
+                    # --- DB にセッション記録 ---
+                    # VC 作成に成功したら、DB にセッション情報を保存する。
+                    # 失敗した場合は作成した VC を削除してクリーンアップ。
+                    voice_session = None
+                    try:
+                        voice_session = await create_voice_session(
+                            session,
+                            lobby_id=lobby.id,
+                            channel_id=str(new_channel.id),
+                            owner_id=owner_id,
+                            name=channel_name,
+                            sequence_number=sequence_number,
+                        )
+                        # 最初のメンバーとして DB に登録
+                        await add_voice_session_member(
+                            session, voice_session.id, str(member.id)
+                        )
+                    except IntegrityError:
+                        await session.rollback()
+                        if voice_session is not None:
+                            try:
+                                await delete_voice_session(session, str(new_channel.id))
+                            except Exception:
+                                logger.exception(
+                                    "Failed to cleanup voice session %s after "
+                                    "member registration conflict",
+                                    new_channel.id,
+                                )
+                            with contextlib.suppress(discord.HTTPException):
+                                await new_channel.delete()
+                            raise
+
+                        await new_channel.delete()
+                        new_channel = None
+                        if not is_numbered_lobby(lobby):
+                            raise
+                        logger.info(
+                            "Sequence conflict for lobby %s, retrying VC creation",
+                            lobby.id,
+                        )
+                        continue
+                    except Exception:
+                        await session.rollback()
+                        if voice_session is not None:
+                            try:
+                                await delete_voice_session(session, str(new_channel.id))
+                            except Exception:
+                                logger.exception(
+                                    "Failed to cleanup voice session %s after "
+                                    "member registration failure",
+                                    new_channel.id,
+                                )
+                        with contextlib.suppress(discord.HTTPException):
+                            await new_channel.delete()
+                        raise
+                    # VC 作成成功後、クールダウンを記録
+                    record_vc_create_cooldown(member.id)
+                    break
+                else:
+                    logger.error("Failed to allocate sequence for lobby %s", lobby.id)
+                    with contextlib.suppress(discord.HTTPException, discord.Forbidden):
+                        await member.send(
+                            "VC の作成に失敗しました。少し待ってください。"
+                        )
+                    return
+
+            if new_channel is None or voice_session is None:
+                return
 
             # --- チャンネル初期化 ---
             # DB セッション作成後の全操作をまとめてエラーハンドリングする。
@@ -767,16 +963,31 @@ class VoiceCog(commands.Cog):
                 # コントロールパネル (Embed + ボタン) を送信
                 embed = create_control_panel_embed(
                     voice_session,
-                    member,
+                    member if owner_id is not None else None,
                     user_limit=self._get_channel_user_limit(new_channel),
+                    lobby=lobby,
                 )
                 view = ControlPanelView(
                     voice_session.id,
                     voice_session.is_locked,
                     voice_session.is_hidden,
+                    lobby=lobby,
                 )
-                self.bot.add_view(view)
-                panel_msg = await new_channel.send(embed=embed, view=view)
+                if view.children:
+                    if isinstance(lobby, Lobby):
+                        self.bot.add_view(
+                            ControlPanelView(
+                                voice_session.id,
+                                voice_session.is_locked,
+                                voice_session.is_hidden,
+                            )
+                        )
+                    else:
+                        self.bot.add_view(view)
+                if view.children:
+                    panel_msg = await new_channel.send(embed=embed, view=view)
+                else:
+                    panel_msg = await new_channel.send(embed=embed)
 
                 # コントロールパネルをピン留めする。
                 # _transfer_ownership で pins() から確実に見つけられるようにする。
@@ -999,8 +1210,62 @@ class VoiceCog(commands.Cog):
     )
 
     @vc_group.command(name="lobby", description="ロビーVCを作成します")
+    @app_commands.choices(
+        naming_mode=[
+            app_commands.Choice(name="個人名", value=LOBBY_NAMING_PERSONAL),
+            app_commands.Choice(name="連番", value=LOBBY_NAMING_NUMBERED),
+        ],
+        number_style=[
+            app_commands.Choice(name="半角", value=NUMBER_STYLE_HALF),
+            app_commands.Choice(name="全角", value=NUMBER_STYLE_FULL),
+        ],
+        number_match_mode=[
+            app_commands.Choice(name="半角のみ", value=NUMBER_MATCH_HALF),
+            app_commands.Choice(name="全角のみ", value=NUMBER_MATCH_FULL),
+            app_commands.Choice(name="両方", value=NUMBER_MATCH_BOTH),
+        ],
+        owner_mode=[
+            app_commands.Choice(name="オーナーあり", value=LOBBY_OWNER_MODE_OWNER),
+            app_commands.Choice(name="オーナーなし", value=LOBBY_OWNER_MODE_NONE),
+        ],
+        control_policy=[
+            app_commands.Choice(name="オーナーのみ", value=LOBBY_CONTROL_OWNER),
+            app_commands.Choice(name="VC参加者", value=LOBBY_CONTROL_MEMBERS),
+            app_commands.Choice(name="管理者のみ", value=LOBBY_CONTROL_ADMINS),
+        ],
+        feature_preset=[
+            app_commands.Choice(name="全機能", value=FEATURE_PRESET_FULL),
+            app_commands.Choice(name="人数のみ", value=FEATURE_PRESET_LIMIT_ONLY),
+        ],
+    )
     @app_commands.default_permissions(administrator=True)
-    async def vc_lobby(self, interaction: discord.Interaction) -> None:
+    async def vc_lobby(
+        self,
+        interaction: discord.Interaction,
+        lobby_name: str = "➕ 新規VC作成",
+        naming_mode: str = LOBBY_NAMING_PERSONAL,
+        room_prefix: str | None = None,
+        number_style: str = NUMBER_STYLE_HALF,
+        number_match_mode: str = NUMBER_MATCH_BOTH,
+        start_number: int = 1,
+        owner_mode: str = LOBBY_OWNER_MODE_OWNER,
+        control_policy: str = LOBBY_CONTROL_OWNER,
+        feature_preset: str = FEATURE_PRESET_FULL,
+        default_user_limit: int = 0,
+        allow_rename: bool | None = None,
+        allow_limit: bool | None = None,
+        allow_bitrate: bool | None = None,
+        allow_region: bool | None = None,
+        allow_lock: bool | None = None,
+        allow_hide: bool | None = None,
+        allow_nsfw: bool | None = None,
+        allow_transfer: bool | None = None,
+        allow_kick: bool | None = None,
+        allow_dissolve: bool | None = None,
+        allow_block: bool | None = None,
+        allow_connect: bool | None = None,
+        allow_camera: bool | None = None,
+    ) -> None:
         """ロビー VC を作成するスラッシュコマンド。
 
         処理の流れ:
@@ -1026,32 +1291,92 @@ class VoiceCog(commands.Cog):
             return
 
         guild_id = str(interaction.guild_id)
+        feature_overrides = {
+            "allow_rename": allow_rename,
+            "allow_limit": allow_limit,
+            "allow_bitrate": allow_bitrate,
+            "allow_region": allow_region,
+            "allow_lock": allow_lock,
+            "allow_hide": allow_hide,
+            "allow_nsfw": allow_nsfw,
+            "allow_transfer": allow_transfer,
+            "allow_kick": allow_kick,
+            "allow_dissolve": allow_dissolve,
+            "allow_block": allow_block,
+            "allow_allow": allow_connect,
+            "allow_camera": allow_camera,
+        }
+
+        if default_user_limit < 0 or default_user_limit > 99:
+            await interaction.followup.send(
+                "デフォルト人数制限は 0〜99 の範囲で指定してください。",
+                ephemeral=True,
+            )
+            return
+        if start_number < 1:
+            await interaction.followup.send(
+                "開始番号は 1 以上で指定してください。",
+                ephemeral=True,
+            )
+            return
+        if naming_mode == LOBBY_NAMING_NUMBERED and not room_prefix:
+            await interaction.followup.send(
+                "連番ロビーでは room_prefix を指定してください。",
+                ephemeral=True,
+            )
+            return
+
+        if (
+            owner_mode == LOBBY_OWNER_MODE_NONE
+            and control_policy == LOBBY_CONTROL_OWNER
+        ):
+            control_policy = LOBBY_CONTROL_MEMBERS
+
+        feature_flags = _resolve_feature_flags(feature_preset, feature_overrides)
+        if owner_mode == LOBBY_OWNER_MODE_NONE:
+            feature_flags["allow_transfer"] = False
+
+        is_legacy_request = _is_legacy_lobby_request(
+            lobby_name=lobby_name,
+            naming_mode=naming_mode,
+            room_prefix=room_prefix,
+            number_style=number_style,
+            number_match_mode=number_match_mode,
+            start_number=start_number,
+            owner_mode=owner_mode,
+            control_policy=control_policy,
+            feature_preset=feature_preset,
+            default_user_limit=default_user_limit,
+            feature_overrides=feature_overrides,
+        )
 
         # ギルド単位のロックで重複作成を防止
         async with get_resource_lock(f"lobby_create:{guild_id}"):
             # --- 重複チェック ---
-            # 1サーバーにつきロビーは1つまで
+            # 引数なしの従来ロビー作成だけは後方互換として 1 サーバー 1 件を維持。
+            # 設定付きロビーは通常ロビーと併存できる。
             async with async_session() as session:
-                existing = await get_lobbies_by_guild(session, guild_id)
-                if existing:
-                    # Discord 上にチャンネルが実在するか確認
-                    lobby = existing[0]
-                    channel = interaction.guild.get_channel(int(lobby.lobby_channel_id))
-                    if channel is not None:
-                        await interaction.followup.send(
-                            "このサーバーには既にロビーが存在します。",
-                            ephemeral=True,
+                if is_legacy_request:
+                    existing = await get_lobbies_by_guild(session, guild_id)
+                    for lobby in existing:
+                        channel = interaction.guild.get_channel(
+                            int(lobby.lobby_channel_id)
                         )
-                        return
-                    # チャンネルが削除済み → 孤立レコードを掃除
-                    await delete_lobby(session, lobby.id)
-                    if self._lobby_channel_ids is not None:
-                        self._lobby_channel_ids.discard(lobby.lobby_channel_id)
+                        if channel is not None:
+                            await interaction.followup.send(
+                                "このサーバーには既にロビーが存在します。",
+                                ephemeral=True,
+                            )
+                            return
+                        # チャンネルが削除済み → 孤立レコードを掃除
+                        await delete_lobby(session, lobby.id)
+                        if self._lobby_channel_ids is not None:
+                            self._lobby_channel_ids.discard(lobby.lobby_channel_id)
 
             # --- VC の作成 ---
             try:
                 lobby_channel = await interaction.guild.create_voice_channel(
-                    name="➕ 新規VC作成",
+                    name=lobby_name,
                     rtc_region=DEFAULT_RTC_REGION,
                 )
             except discord.HTTPException as e:
@@ -1063,13 +1388,30 @@ class VoiceCog(commands.Cog):
             # --- DB にロビーとして登録 ---
             lobby_channel_id_str = str(lobby_channel.id)
             async with async_session() as session:
-                await create_lobby(
-                    session,
-                    guild_id=guild_id,
-                    lobby_channel_id=lobby_channel_id_str,
-                    category_id=None,
-                    default_user_limit=0,
-                )
+                if is_legacy_request:
+                    await create_lobby(
+                        session,
+                        guild_id=guild_id,
+                        lobby_channel_id=lobby_channel_id_str,
+                        category_id=None,
+                        default_user_limit=0,
+                    )
+                else:
+                    await create_lobby(
+                        session,
+                        guild_id=guild_id,
+                        lobby_channel_id=lobby_channel_id_str,
+                        category_id=None,
+                        default_user_limit=default_user_limit,
+                        naming_mode=naming_mode,
+                        room_prefix=room_prefix,
+                        number_style=number_style,
+                        number_match_mode=number_match_mode,
+                        start_number=start_number,
+                        owner_mode=owner_mode,
+                        control_policy=control_policy,
+                        **feature_flags,
+                    )
 
             # キャッシュに追加
             if self._lobby_channel_ids is not None:

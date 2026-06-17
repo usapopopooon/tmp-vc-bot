@@ -99,8 +99,20 @@ class EphemeralVCBot(commands.Bot):
                     voice_session.is_locked,
                     voice_session.is_hidden,
                     is_nsfw,
+                    lobby=voice_session.lobby,
                 )
-                self.add_view(view)
+                if view.children:
+                    if voice_session.lobby is None:
+                        self.add_view(view)
+                    else:
+                        self.add_view(
+                            ControlPanelView(
+                                voice_session.id,
+                                voice_session.is_locked,
+                                voice_session.is_hidden,
+                                is_nsfw,
+                            )
+                        )
 
         # 3. スラッシュコマンドの同期
         # SYNC_GUILD_IDS にカンマ区切りでギルド ID を列挙すると、それぞれへ

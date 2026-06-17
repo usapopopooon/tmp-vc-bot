@@ -674,6 +674,61 @@ class TestHandleLobbyJoin:
             new_channel.delete.assert_awaited_once()
             mock_delete.assert_awaited_once_with(mock_session, "200")
 
+    async def test_cleanup_on_initial_member_record_failure(self) -> None:
+        """初期メンバー登録失敗時に作成済み VC と DB レコードを片付ける。"""
+        cog = _make_cog()
+        member = _make_member(1)
+        channel = _make_channel(100)
+        channel.category = MagicMock(spec=discord.CategoryChannel)
+
+        lobby = MagicMock()
+        lobby.id = 10
+        lobby.category_id = None
+        lobby.default_user_limit = 0
+
+        new_channel = _make_channel(200)
+        new_channel.delete = AsyncMock()
+
+        guild = MagicMock(spec=discord.Guild)
+        guild.create_voice_channel = AsyncMock(return_value=new_channel)
+        guild.default_role = MagicMock()
+        member.guild = guild
+        member.move_to = AsyncMock()
+
+        voice_session = _make_voice_session(channel_id="200")
+
+        mock_factory, mock_session = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_lobby_by_channel_id",
+                new_callable=AsyncMock,
+                return_value=lobby,
+            ),
+            patch(
+                "src.cogs.voice.create_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+            patch(
+                "src.cogs.voice.add_voice_session_member",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("member insert failed"),
+            ),
+            patch(
+                "src.cogs.voice.delete_voice_session",
+                new_callable=AsyncMock,
+            ) as mock_delete,
+        ):
+            member.voice.channel = channel
+            with pytest.raises(RuntimeError, match="member insert failed"):
+                await cog._handle_lobby_join(member, channel)
+
+        mock_session.rollback.assert_awaited_once()
+        new_channel.delete.assert_awaited_once()
+        mock_delete.assert_awaited_once_with(mock_session, "200")
+        member.move_to.assert_not_awaited()
+
     async def test_moves_only_triggering_lobby_member(self) -> None:
         """ロビー参加者ごとに専用 VC を作り、起点ユーザーだけ移動する。"""
         cog = _make_cog()
@@ -734,6 +789,87 @@ class TestHandleLobbyJoin:
 
         owner.move_to.assert_awaited_once_with(new_channel)
         peer.move_to.assert_not_awaited()
+
+    async def test_numbered_ownerless_lobby_creates_next_full_width_room(self) -> None:
+        """連番ロビーでは半角/全角を既存番号として読み、設定形式で作成する。"""
+        cog = _make_cog()
+        member = _make_member(1)
+        channel = _make_channel(100)
+        channel.overwrites = {}
+
+        existing = _make_channel(150)
+        existing.name = "作業空間1"
+        category = MagicMock(spec=discord.CategoryChannel)
+        category.voice_channels = [existing]
+        channel.category = category
+
+        lobby = MagicMock()
+        lobby.id = 10
+        lobby.category_id = None
+        lobby.default_user_limit = 0
+        lobby.naming_mode = "numbered"
+        lobby.room_prefix = "作業空間"
+        lobby.number_style = "full"
+        lobby.number_match_mode = "both"
+        lobby.start_number = 1
+        lobby.owner_mode = "none"
+        lobby.control_policy = "members"
+
+        new_channel = _make_channel(200)
+        new_channel.send = AsyncMock(return_value=MagicMock(pin=AsyncMock()))
+
+        guild = MagicMock(spec=discord.Guild)
+        guild.create_voice_channel = AsyncMock(return_value=new_channel)
+        guild.default_role = MagicMock()
+        guild.voice_channels = [existing]
+        member.guild = guild
+        member.move_to = AsyncMock()
+
+        voice_session = _make_voice_session(channel_id="200", owner_id=None)
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_lobby_by_channel_id",
+                new_callable=AsyncMock,
+                return_value=lobby,
+            ),
+            patch(
+                "src.cogs.voice.get_voice_sessions_by_lobby",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "src.cogs.voice.create_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ) as mock_create,
+            patch(
+                "src.cogs.voice.add_voice_session_member",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "src.cogs.voice.create_control_panel_embed",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "src.cogs.voice.ControlPanelView",
+                return_value=MagicMock(),
+            ),
+        ):
+            member.voice.channel = channel
+            await cog._handle_lobby_join(member, channel)
+
+        guild.create_voice_channel.assert_awaited_once()
+        create_kwargs = guild.create_voice_channel.call_args.kwargs
+        assert create_kwargs["name"] == "作業空間２"
+        assert guild.default_role not in create_kwargs["overwrites"]
+        assert member not in create_kwargs["overwrites"]
+        mock_create.assert_awaited_once()
+        assert mock_create.call_args.kwargs["owner_id"] is None
+        assert mock_create.call_args.kwargs["sequence_number"] == 2
+        assert mock_create.call_args.kwargs["name"] == "作業空間２"
 
 
 # ===========================================================================
@@ -1420,6 +1556,87 @@ class TestVcLobbyCommand:
             msg = interaction.followup.send.call_args[0][0]
             assert "➕ 新規VC作成" in msg
             assert interaction.followup.send.call_args[1]["ephemeral"] is True
+
+    async def test_creates_numbered_ownerless_limit_only_lobby(self) -> None:
+        """連番/オーナーなし/人数のみロビーを追加作成できる。"""
+        cog = _make_cog()
+        interaction = _make_interaction(1)
+
+        lobby_channel = MagicMock(spec=discord.VoiceChannel)
+        lobby_channel.id = 500
+        lobby_channel.name = "作業空間作成"
+        interaction.guild.create_voice_channel = AsyncMock(return_value=lobby_channel)
+
+        mock_factory, mock_session = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_lobbies_by_guild",
+                new_callable=AsyncMock,
+            ) as mock_get_lobbies,
+            patch("src.cogs.voice.create_lobby", new_callable=AsyncMock) as mock_create,
+        ):
+            await cog.vc_lobby.callback(
+                cog,
+                interaction,
+                lobby_name="作業空間作成",
+                naming_mode="numbered",
+                room_prefix="作業空間",
+                number_style="full",
+                owner_mode="none",
+                control_policy="members",
+                feature_preset="limit_only",
+            )
+
+        mock_get_lobbies.assert_not_awaited()
+        interaction.guild.create_voice_channel.assert_awaited_once_with(
+            name="作業空間作成",
+            rtc_region="japan",
+        )
+        mock_create.assert_awaited_once()
+        kwargs = mock_create.call_args.kwargs
+        assert mock_create.call_args.args[0] is mock_session
+        assert kwargs["guild_id"] == str(interaction.guild_id)
+        assert kwargs["lobby_channel_id"] == "500"
+        assert kwargs["naming_mode"] == "numbered"
+        assert kwargs["room_prefix"] == "作業空間"
+        assert kwargs["number_style"] == "full"
+        assert kwargs["owner_mode"] == "none"
+        assert kwargs["control_policy"] == "members"
+        assert kwargs["allow_limit"] is True
+        assert kwargs["allow_rename"] is False
+        assert kwargs["allow_transfer"] is False
+        assert kwargs["allow_kick"] is False
+
+    async def test_limit_only_preset_does_not_override_owner_policy(self) -> None:
+        """人数のみプリセットは機能フラグだけを変更する。"""
+        cog = _make_cog()
+        interaction = _make_interaction(1)
+
+        lobby_channel = MagicMock(spec=discord.VoiceChannel)
+        lobby_channel.id = 501
+        lobby_channel.name = "人数部屋作成"
+        interaction.guild.create_voice_channel = AsyncMock(return_value=lobby_channel)
+
+        mock_factory, _mock_session = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch("src.cogs.voice.create_lobby", new_callable=AsyncMock) as mock_create,
+        ):
+            await cog.vc_lobby.callback(
+                cog,
+                interaction,
+                lobby_name="人数部屋作成",
+                feature_preset="limit_only",
+            )
+
+        mock_create.assert_awaited_once()
+        kwargs = mock_create.call_args.kwargs
+        assert kwargs["owner_mode"] == "owner"
+        assert kwargs["control_policy"] == "owner"
+        assert kwargs["allow_limit"] is True
+        assert kwargs["allow_rename"] is False
+        assert kwargs["allow_transfer"] is False
 
     async def test_rejects_dm(self) -> None:
         """DM からの実行は拒否される。"""

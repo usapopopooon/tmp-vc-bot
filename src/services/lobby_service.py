@@ -2,6 +2,7 @@
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.database.models import Lobby, VoiceSession, VoiceSessionMember
 
@@ -17,6 +18,7 @@ __all__ = [
     "get_all_voice_sessions",
     "get_lobbies_by_guild",
     "get_lobby_by_channel_id",
+    "get_voice_sessions_by_lobby",
     "get_voice_session",
     "get_voice_session_members_ordered",
     "remove_voice_session_member",
@@ -94,6 +96,26 @@ async def create_lobby(
     lobby_channel_id: str,
     category_id: str | None = None,
     default_user_limit: int = 0,
+    naming_mode: str = "personal",
+    room_prefix: str | None = None,
+    number_style: str = "half",
+    number_match_mode: str = "both",
+    start_number: int = 1,
+    owner_mode: str = "owner",
+    control_policy: str = "owner",
+    allow_rename: bool = True,
+    allow_limit: bool = True,
+    allow_bitrate: bool = True,
+    allow_region: bool = True,
+    allow_lock: bool = True,
+    allow_hide: bool = True,
+    allow_nsfw: bool = True,
+    allow_transfer: bool = True,
+    allow_kick: bool = True,
+    allow_dissolve: bool = True,
+    allow_block: bool = True,
+    allow_allow: bool = True,
+    allow_camera: bool = True,
 ) -> Lobby:
     """新しいロビーを DB に登録する。
 
@@ -138,6 +160,26 @@ async def create_lobby(
         lobby_channel_id=lobby_channel_id,
         category_id=category_id,
         default_user_limit=default_user_limit,
+        naming_mode=naming_mode,
+        room_prefix=room_prefix,
+        number_style=number_style,
+        number_match_mode=number_match_mode,
+        start_number=start_number,
+        owner_mode=owner_mode,
+        control_policy=control_policy,
+        allow_rename=allow_rename,
+        allow_limit=allow_limit,
+        allow_bitrate=allow_bitrate,
+        allow_region=allow_region,
+        allow_lock=allow_lock,
+        allow_hide=allow_hide,
+        allow_nsfw=allow_nsfw,
+        allow_transfer=allow_transfer,
+        allow_kick=allow_kick,
+        allow_dissolve=allow_dissolve,
+        allow_block=allow_block,
+        allow_allow=allow_allow,
+        allow_camera=allow_camera,
     )
     # session.add(): セッションにオブジェクトを追加 (INSERT 予約)
     session.add(lobby)
@@ -218,7 +260,9 @@ async def get_voice_session(
         セッションが見つかれば VoiceSession、なければ None
     """
     result = await session.execute(
-        select(VoiceSession).where(VoiceSession.channel_id == channel_id)
+        select(VoiceSession)
+        .options(selectinload(VoiceSession.lobby))
+        .where(VoiceSession.channel_id == channel_id)
     )
     return result.scalar_one_or_none()
 
@@ -234,7 +278,22 @@ async def get_all_voice_sessions(session: AsyncSession) -> list[VoiceSession]:
     Returns:
         全 VoiceSession のリスト
     """
-    result = await session.execute(select(VoiceSession))
+    result = await session.execute(
+        select(VoiceSession).options(selectinload(VoiceSession.lobby))
+    )
+    return list(result.scalars().all())
+
+
+async def get_voice_sessions_by_lobby(
+    session: AsyncSession,
+    lobby_id: int,
+) -> list[VoiceSession]:
+    """指定ロビーから作られたアクティブな VC セッションを取得する。"""
+    result = await session.execute(
+        select(VoiceSession)
+        .options(selectinload(VoiceSession.lobby))
+        .where(VoiceSession.lobby_id == lobby_id)
+    )
     return list(result.scalars().all())
 
 
@@ -242,8 +301,9 @@ async def create_voice_session(
     session: AsyncSession,
     lobby_id: int,
     channel_id: str,
-    owner_id: str,
+    owner_id: str | None,
     name: str,
+    sequence_number: int | None = None,
 ) -> VoiceSession:
     """新しい VC セッションを DB に登録する。
 
@@ -292,6 +352,7 @@ async def create_voice_session(
         channel_id=channel_id,
         owner_id=owner_id,
         name=name,
+        sequence_number=sequence_number,
     )
     session.add(voice_session)
     await session.commit()

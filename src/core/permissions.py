@@ -105,17 +105,17 @@ def build_unlocked_overwrites(
     return overwrites
 
 
-def is_owner(session_owner_id: str, user_id: int) -> bool:
+def is_owner(session_owner_id: str | None, user_id: int) -> bool:
     """ユーザーがチャンネルオーナーかどうかを判定する。
 
     DB には owner_id を文字列 (str) で保存しているが、
     Discord API は int で返すため、型を合わせて比較する。
 
     Args:
-        session_owner_id: DB に保存されたオーナー ID (文字列)
+        session_owner_id: DB に保存されたオーナー ID (文字列)。オーナーなしなら None。
         user_id: 判定したいユーザーの ID (整数)
 
     Returns:
         オーナーなら True
     """
-    return session_owner_id == str(user_id)
+    return session_owner_id is not None and session_owner_id == str(user_id)

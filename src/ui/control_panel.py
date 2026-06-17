@@ -27,10 +27,31 @@ import discord
 from discord.ext import commands
 
 from src.constants import DEFAULT_EMBED_COLOR
+from src.core.lobby_config import (
+    FEATURE_ALLOW,
+    FEATURE_BITRATE,
+    FEATURE_BLOCK,
+    FEATURE_CAMERA,
+    FEATURE_DISSOLVE,
+    FEATURE_HIDE,
+    FEATURE_KICK,
+    FEATURE_LIMIT,
+    FEATURE_LOCK,
+    FEATURE_NSFW,
+    FEATURE_REGION,
+    FEATURE_RENAME,
+    FEATURE_TRANSFER,
+    LOBBY_CONTROL_ADMINS,
+    LOBBY_CONTROL_MEMBERS,
+    LOBBY_CONTROL_OWNER,
+    enabled_features,
+    get_control_policy,
+    is_feature_enabled,
+)
 from src.core.permissions import is_owner
 from src.core.validators import validate_channel_name, validate_user_limit
 from src.database.engine import async_session
-from src.database.models import VoiceSession
+from src.database.models import Lobby, VoiceSession
 from src.services.db_service import (
     delete_voice_session,
     get_voice_session,
@@ -148,7 +169,11 @@ async def _find_panel_message(
 
 
 def create_control_panel_embed(
-    session: VoiceSession, owner: discord.Member, *, user_limit: int
+    session: VoiceSession,
+    owner: discord.Member | None,
+    *,
+    user_limit: int,
+    lobby: Lobby | None = None,
 ) -> discord.Embed:
     """コントロールパネルの Embed (情報表示部分) を作成する。
 
@@ -164,15 +189,15 @@ def create_control_panel_embed(
     """
     embed = discord.Embed(
         title="ボイスチャンネル設定",
-        # owner.mention → @ユーザー名 のメンション形式 (クリックでプロフィール表示)
-        description=f"オーナー: {owner.mention}",
+        description=(f"オーナー: {owner.mention}" if owner else "共有チャンネル"),
         color=DEFAULT_EMBED_COLOR,
     )
 
     lock_status = "ロック中" if session.is_locked else "未ロック"
     limit_status = str(user_limit) if user_limit > 0 else "無制限"
 
-    embed.add_field(name="状態", value=lock_status, inline=True)
+    if is_feature_enabled(lobby, FEATURE_LOCK):
+        embed.add_field(name="状態", value=lock_status, inline=True)
     embed.add_field(name="人数制限", value=limit_status, inline=True)
 
     return embed
@@ -184,6 +209,32 @@ def _get_channel_user_limit(channel: discord.VoiceChannel) -> int:
     if isinstance(user_limit, int):
         return user_limit
     return 0
+
+
+def _session_lobby(voice_session: VoiceSession) -> Lobby | None:
+    """VoiceSession にロード済みの Lobby があれば返す。"""
+    lobby = getattr(voice_session, "lobby", None)
+    return lobby if isinstance(lobby, Lobby) else None
+
+
+def _create_control_panel_view(
+    session_id: int,
+    is_locked: bool = False,
+    is_hidden: bool = False,
+    is_nsfw: bool = False,
+    *,
+    lobby: Lobby | None = None,
+) -> "ControlPanelView":
+    """設定がない場合は従来と同じ引数で ControlPanelView を作る。"""
+    if lobby is None:
+        return ControlPanelView(session_id, is_locked, is_hidden, is_nsfw)
+    return ControlPanelView(
+        session_id,
+        is_locked,
+        is_hidden,
+        is_nsfw,
+        lobby=lobby,
+    )
 
 
 def _copy_overwrite(
@@ -221,33 +272,135 @@ async def _edit_component_error(
         await interaction.followup.send(content, ephemeral=True)
 
 
-async def _ensure_current_owner(interaction: discord.Interaction) -> bool:
-    """セレクト/確認 UI 操作時点でも現在のオーナーか確認する。"""
+async def _send_control_error(
+    interaction: discord.Interaction,
+    content: str,
+    *,
+    edit_message: bool,
+) -> None:
+    """操作不可理由を interaction の種類に合わせて返す。"""
+    if edit_message:
+        await _edit_component_error(interaction, content)
+        return
+
+    try:
+        await interaction.response.send_message(content, ephemeral=True)
+    except discord.InteractionResponded:
+        await interaction.followup.send(content, ephemeral=True)
+
+
+def _is_member_in_interaction_channel(interaction: discord.Interaction) -> bool:
+    """操作ユーザーが現在の VC にいるかどうかを返す。"""
+    channel = interaction.channel
+    user = interaction.user
+    return (
+        isinstance(channel, discord.VoiceChannel)
+        and isinstance(user, discord.Member)
+        and user.voice is not None
+        and user.voice.channel == channel
+    )
+
+
+async def _ensure_can_control(
+    interaction: discord.Interaction,
+    feature: str | None = None,
+    *,
+    edit_message: bool = False,
+) -> bool:
+    """操作時点のロビー設定に基づき、機能と操作者権限を確認する。"""
     if interaction.channel_id is None:
-        await _edit_component_error(interaction, "セッションが見つかりません。")
+        await _send_control_error(
+            interaction,
+            "セッションが見つかりません。",
+            edit_message=edit_message,
+        )
         return False
 
     async with async_session() as db_session:
         voice_session = await get_voice_session(db_session, str(interaction.channel_id))
         if not voice_session:
-            await _edit_component_error(interaction, "セッションが見つかりません。")
-            return False
-
-        if not is_owner(voice_session.owner_id, interaction.user.id):
-            await _edit_component_error(
+            await _send_control_error(
                 interaction,
-                "チャンネルオーナーのみ操作できます。",
+                "セッションが見つかりません。",
+                edit_message=edit_message,
             )
             return False
+
+        lobby = _session_lobby(voice_session)
+        if feature is not None and not is_feature_enabled(lobby, feature):
+            await _send_control_error(
+                interaction,
+                "このチャンネルではこの機能は無効です。",
+                edit_message=edit_message,
+            )
+            return False
+
+        policy = get_control_policy(lobby)
+        user_is_admin = (
+            isinstance(interaction.user, discord.Member)
+            and interaction.user.guild_permissions.administrator
+        )
+
+        if policy == LOBBY_CONTROL_ADMINS:
+            if user_is_admin:
+                return True
+            await _send_control_error(
+                interaction,
+                "管理者のみ操作できます。",
+                edit_message=edit_message,
+            )
+            return False
+
+        if policy == LOBBY_CONTROL_MEMBERS:
+            if user_is_admin or _is_member_in_interaction_channel(interaction):
+                return True
+            await _send_control_error(
+                interaction,
+                "この VC に参加しているメンバーのみ操作できます。",
+                edit_message=edit_message,
+            )
+            return False
+
+        if policy == LOBBY_CONTROL_OWNER and is_owner(
+            voice_session.owner_id, interaction.user.id
+        ):
+            return True
+
+        await _send_control_error(
+            interaction,
+            "チャンネルオーナーのみ操作できます。",
+            edit_message=edit_message,
+        )
+        return False
 
     return True
 
 
-class _OwnerOnlyView(discord.ui.View):
-    """現在のチャンネルオーナーだけが操作できる ephemeral View。"""
+async def _ensure_current_owner(interaction: discord.Interaction) -> bool:
+    """後方互換用: 現在のチャンネルオーナーだけ許可する。"""
+    return await _ensure_can_control(interaction, edit_message=True)
+
+
+class _ControlPolicyView(discord.ui.View):
+    """現在のロビー設定に基づいて操作可否を判定する ephemeral View。"""
+
+    def __init__(self, feature: str, *, timeout: float | None = 60) -> None:
+        super().__init__(timeout=timeout)
+        self.feature = feature
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return await _ensure_current_owner(interaction)
+        return await _ensure_can_control(
+            interaction,
+            self.feature,
+            edit_message=True,
+        )
+
+
+class _OwnerOnlyView(_ControlPolicyView):
+    """後方互換用: owner policy の View 名を維持する。"""
+
+    def __init__(self, *, timeout: float | None = 60) -> None:
+        super().__init__(FEATURE_TRANSFER, timeout=timeout)
 
 
 async def refresh_panel_embed(
@@ -262,8 +415,12 @@ async def refresh_panel_embed(
             logger.debug("No voice session found for channel %s", channel.id)
             return
 
-        owner = channel.guild.get_member(int(voice_session.owner_id))
-        if not owner:
+        owner = (
+            channel.guild.get_member(int(voice_session.owner_id))
+            if voice_session.owner_id is not None
+            else None
+        )
+        if voice_session.owner_id is not None and not owner:
             logger.warning(
                 "Owner %s not found for channel %s",
                 voice_session.owner_id,
@@ -279,19 +436,21 @@ async def refresh_panel_embed(
                 if user_limit_override is not None
                 else _get_channel_user_limit(channel)
             ),
+            lobby=_session_lobby(voice_session),
         )
 
         # パネルメッセージを探して更新 (ピン → 履歴の順)
         panel_msg = await _find_panel_message(channel)
         if panel_msg:
-            view = ControlPanelView(
+            view = _create_control_panel_view(
                 voice_session.id,
                 voice_session.is_locked,
                 voice_session.is_hidden,
                 channel.nsfw,
+                lobby=_session_lobby(voice_session),
             )
             try:
-                await panel_msg.edit(embed=embed, view=view)
+                await panel_msg.edit(embed=embed, view=view if view.children else None)
             except discord.HTTPException as e:
                 logger.error(
                     "Failed to edit panel message in channel %s: %s",
@@ -315,8 +474,12 @@ async def repost_panel(
             logger.debug("No voice session found for channel %s in repost", channel.id)
             return
 
-        owner = channel.guild.get_member(int(voice_session.owner_id))
-        if not owner:
+        owner = (
+            channel.guild.get_member(int(voice_session.owner_id))
+            if voice_session.owner_id is not None
+            else None
+        )
+        if voice_session.owner_id is not None and not owner:
             logger.warning(
                 "Owner %s not found for channel %s in repost",
                 voice_session.owner_id,
@@ -341,16 +504,33 @@ async def repost_panel(
             voice_session,
             owner,
             user_limit=_get_channel_user_limit(channel),
+            lobby=_session_lobby(voice_session),
         )
-        view = ControlPanelView(
+        view = _create_control_panel_view(
             voice_session.id,
             voice_session.is_locked,
             voice_session.is_hidden,
             channel.nsfw,
+            lobby=_session_lobby(voice_session),
         )
-        bot.add_view(view)
+        if view.children:
+            lobby = _session_lobby(voice_session)
+            if lobby is None:
+                bot.add_view(view)
+            else:
+                bot.add_view(
+                    ControlPanelView(
+                        voice_session.id,
+                        voice_session.is_locked,
+                        voice_session.is_hidden,
+                        channel.nsfw,
+                    )
+                )
         try:
-            panel_msg = await channel.send(embed=embed, view=view)
+            if view.children:
+                panel_msg = await channel.send(embed=embed, view=view)
+            else:
+                panel_msg = await channel.send(embed=embed)
             try:
                 await panel_msg.pin()
             except discord.HTTPException as e:
@@ -410,6 +590,9 @@ class RenameModal(discord.ui.Modal, title="チャンネル名変更"):
             )
             return
 
+        if not await _ensure_can_control(interaction, FEATURE_RENAME):
+            return
+
         async with async_session() as db_session:
             voice_session = await get_voice_session(
                 db_session, str(interaction.channel_id)
@@ -417,12 +600,6 @@ class RenameModal(discord.ui.Modal, title="チャンネル名変更"):
             if not voice_session:
                 await interaction.response.send_message(
                     "セッションが見つかりません。", ephemeral=True
-                )
-                return
-
-            if not is_owner(voice_session.owner_id, interaction.user.id):
-                await interaction.response.send_message(
-                    "オーナーのみチャンネル名を変更できます。", ephemeral=True
                 )
                 return
 
@@ -478,6 +655,9 @@ class UserLimitModal(discord.ui.Modal, title="人数制限変更"):
             )
             return
 
+        if not await _ensure_can_control(interaction, FEATURE_LIMIT):
+            return
+
         async with async_session() as db_session:
             voice_session = await get_voice_session(
                 db_session, str(interaction.channel_id)
@@ -485,12 +665,6 @@ class UserLimitModal(discord.ui.Modal, title="人数制限変更"):
             if not voice_session:
                 await interaction.response.send_message(
                     "セッションが見つかりません。", ephemeral=True
-                )
-                return
-
-            if not is_owner(voice_session.owner_id, interaction.user.id):
-                await interaction.response.send_message(
-                    "オーナーのみ人数制限を変更できます。", ephemeral=True
                 )
                 return
 
@@ -535,7 +709,7 @@ class UserLimitModal(discord.ui.Modal, title="人数制限変更"):
 # ephemeral = 操作者にだけ見えるメッセージとして表示される
 
 
-class TransferSelectView(_OwnerOnlyView):
+class TransferSelectView(_ControlPolicyView):
     """オーナー譲渡先を選択するセレクトメニュー。
 
     チャンネル内のメンバー一覧をドロップダウンで表示する。
@@ -543,7 +717,7 @@ class TransferSelectView(_OwnerOnlyView):
     """
 
     def __init__(self, channel: discord.VoiceChannel, owner_id: int) -> None:
-        super().__init__(timeout=60)
+        super().__init__(FEATURE_TRANSFER, timeout=60)
         # オーナー自身と Bot を除外した候補リストを作成
         members = [m for m in channel.members if m.id != owner_id and not m.bot]
         if not members:
@@ -597,6 +771,11 @@ class TransferSelectMenu(discord.ui.Select[Any]):
                         content="セッションが見つかりません。", view=None
                     )
                     return
+                if voice_session.owner_id is None:
+                    await interaction.response.edit_message(
+                        content="このチャンネルにはオーナーがいません。", view=None
+                    )
+                    return
 
                 # テキストチャット権限の移行
                 # 旧オーナー: read_message_history=None (ロール設定に戻す)
@@ -630,7 +809,7 @@ class TransferSelectMenu(discord.ui.Select[Any]):
             await repost_panel(channel, interaction.client)  # type: ignore[arg-type]
 
 
-class KickSelectView(_OwnerOnlyView):
+class KickSelectView(_ControlPolicyView):
     """キック対象を選択するセレクトメニュー。
 
     チャンネル内のメンバー一覧をドロップダウンで表示する。
@@ -638,7 +817,7 @@ class KickSelectView(_OwnerOnlyView):
     """
 
     def __init__(self, channel: discord.VoiceChannel, owner_id: int) -> None:
-        super().__init__(timeout=60)
+        super().__init__(FEATURE_KICK, timeout=60)
         # オーナー自身と Bot を除外した候補リストを作成
         members = [m for m in channel.members if m.id != owner_id and not m.bot]
         if not members:
@@ -684,7 +863,7 @@ class KickSelectMenu(discord.ui.Select[Any]):
         await channel.send(f"👟 {user_to_kick.mention} がキックされました。")
 
 
-class BlockSelectView(_OwnerOnlyView):
+class BlockSelectView(_ControlPolicyView):
     """ブロック対象を選択するユーザーセレクト。
 
     ブロック = connect=False で接続権限を拒否する。
@@ -692,7 +871,7 @@ class BlockSelectView(_OwnerOnlyView):
     """
 
     def __init__(self, owner_id: int) -> None:
-        super().__init__(timeout=60)
+        super().__init__(FEATURE_BLOCK, timeout=60)
         self.owner_id = owner_id
 
     @discord.ui.select(
@@ -735,7 +914,7 @@ class BlockSelectView(_OwnerOnlyView):
         await channel.send(f"🚫 {user_to_block.mention} がブロックされました。")
 
 
-class AllowSelectView(_OwnerOnlyView):
+class AllowSelectView(_ControlPolicyView):
     """許可対象を選択するユーザーセレクト。
 
     許可 = connect=True で接続権限を許可する。
@@ -743,7 +922,7 @@ class AllowSelectView(_OwnerOnlyView):
     """
 
     def __init__(self) -> None:
-        super().__init__(timeout=60)
+        super().__init__(FEATURE_ALLOW, timeout=60)
 
     @discord.ui.select(
         cls=discord.ui.UserSelect, placeholder="許可するユーザーを選択..."
@@ -768,7 +947,7 @@ class AllowSelectView(_OwnerOnlyView):
         await channel.send(f"✅ {user_to_allow.mention} が許可されました。")
 
 
-class CameraToggleSelectView(_OwnerOnlyView):
+class CameraToggleSelectView(_ControlPolicyView):
     """カメラ権限をトグルするセレクトメニュー。
 
     チャンネル内のメンバー一覧をドロップダウンで表示する。
@@ -777,7 +956,7 @@ class CameraToggleSelectView(_OwnerOnlyView):
     """
 
     def __init__(self, channel: discord.VoiceChannel, owner_id: int) -> None:
-        super().__init__(timeout=60)
+        super().__init__(FEATURE_CAMERA, timeout=60)
         self.channel = channel
         # オーナー自身と Bot を除外した候補リストを作成
         members = [m for m in channel.members if m.id != owner_id and not m.bot]
@@ -838,7 +1017,7 @@ class CameraToggleSelectMenu(discord.ui.Select[Any]):
             await channel.send(f"📵 {user.mention} のカメラ配信が禁止されました。")
 
 
-class BitrateSelectView(discord.ui.View):
+class BitrateSelectView(_ControlPolicyView):
     """ビットレートを選択するセレクトメニュー。
 
     ビットレート = 音声品質。高いほど高音質だが帯域を使う。
@@ -858,7 +1037,7 @@ class BitrateSelectView(discord.ui.View):
     ]
 
     def __init__(self) -> None:
-        super().__init__(timeout=60)
+        super().__init__(FEATURE_BITRATE, timeout=60)
         options = [
             discord.SelectOption(label=label, value=value)
             for label, value in self.BITRATES
@@ -896,7 +1075,7 @@ class BitrateSelectMenu(discord.ui.Select[Any]):
             await channel.send(f"🔊 ビットレートが **{label}** に変更されました。")
 
 
-class RegionSelectView(discord.ui.View):
+class RegionSelectView(_ControlPolicyView):
     """VC リージョン (サーバー地域) を選択するセレクトメニュー。
 
     リージョン = 音声サーバーの地理的位置。近い方が低遅延。
@@ -925,7 +1104,7 @@ class RegionSelectView(discord.ui.View):
     REGION_LABELS = {value: label for label, value in REGIONS}
 
     def __init__(self) -> None:
-        super().__init__(timeout=60)
+        super().__init__(FEATURE_REGION, timeout=60)
         options = [
             discord.SelectOption(label=label, value=value)
             for label, value in self.REGIONS
@@ -956,7 +1135,7 @@ class RegionSelectMenu(discord.ui.Select[Any]):
             await channel.send(f"🌏 リージョンが **{region_name}** に変更されました。")
 
 
-class DissolveConfirmView(_OwnerOnlyView):
+class DissolveConfirmView(_ControlPolicyView):
     """解散の確認ダイアログ。
 
     「解散する」ボタンで10秒カウントダウン後に全メンバーをキックし、
@@ -964,7 +1143,7 @@ class DissolveConfirmView(_OwnerOnlyView):
     """
 
     def __init__(self, channel: discord.VoiceChannel) -> None:
-        super().__init__(timeout=30)
+        super().__init__(FEATURE_DISSOLVE, timeout=30)
         self.channel = channel
 
     @discord.ui.button(
@@ -1085,10 +1264,13 @@ class ControlPanelView(discord.ui.View):
         is_locked: bool = False,
         is_hidden: bool = False,
         is_nsfw: bool = False,
+        *,
+        lobby: Lobby | None = None,
     ) -> None:
         # timeout=None で永続 View にする (タイムアウトしない)
         super().__init__(timeout=None)
         self.session_id = session_id
+        self.enabled_features = enabled_features(lobby)
 
         # 現在の状態に応じてボタンのラベルと絵文字を切り替える
         if is_locked:
@@ -1102,8 +1284,55 @@ class ControlPanelView(discord.ui.View):
         if is_nsfw:
             self.nsfw_button.label = "制限解除"
 
+        self._remove_disabled_buttons()
+
+    def _remove_disabled_buttons(self) -> None:
+        """ロビー設定で無効な機能のボタンを View から外す。"""
+        feature_buttons = (
+            (FEATURE_RENAME, self.rename_button),
+            (FEATURE_LIMIT, self.limit_button),
+            (FEATURE_BITRATE, self.bitrate_button),
+            (FEATURE_REGION, self.region_button),
+            (FEATURE_LOCK, self.lock_button),
+            (FEATURE_HIDE, self.hide_button),
+            (FEATURE_NSFW, self.nsfw_button),
+            (FEATURE_TRANSFER, self.transfer_button),
+            (FEATURE_KICK, self.kick_button),
+            (FEATURE_DISSOLVE, self.dissolve_button),
+            (FEATURE_BLOCK, self.block_button),
+            (FEATURE_ALLOW, self.allow_button),
+            (FEATURE_CAMERA, self.camera_button),
+        )
+        for feature, button in feature_buttons:
+            if feature not in self.enabled_features:
+                self.remove_item(button)
+
+    def _feature_for_interaction(
+        self,
+        interaction: discord.Interaction,
+    ) -> str | None:
+        """押されたボタンの custom_id から機能名を返す。"""
+        data = interaction.data
+        custom_id = data.get("custom_id") if isinstance(data, dict) else None
+        mapping = {
+            "rename_button": FEATURE_RENAME,
+            "limit_button": FEATURE_LIMIT,
+            "bitrate_button": FEATURE_BITRATE,
+            "region_button": FEATURE_REGION,
+            "lock_button": FEATURE_LOCK,
+            "hide_button": FEATURE_HIDE,
+            "nsfw_button": FEATURE_NSFW,
+            "transfer_button": FEATURE_TRANSFER,
+            "kick_button": FEATURE_KICK,
+            "dissolve_button": FEATURE_DISSOLVE,
+            "block_button": FEATURE_BLOCK,
+            "allow_button": FEATURE_ALLOW,
+            "camera_button": FEATURE_CAMERA,
+        }
+        return mapping.get(str(custom_id)) if custom_id is not None else None
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """全ボタン共通の権限チェック。オーナーのみ操作可能。
+        """全ボタン共通の権限チェック。
 
         discord.py が各ボタンのコールバック前に自動で呼ぶ。
         False を返すとコールバックが実行されない。
@@ -1118,24 +1347,10 @@ class ControlPanelView(discord.ui.View):
             )
             return False
 
-        async with async_session() as db_session:
-            voice_session = await get_voice_session(
-                db_session, str(interaction.channel_id)
-            )
-            if not voice_session:
-                await interaction.response.send_message(
-                    "セッションが見つかりません。", ephemeral=True
-                )
-                return False
-
-            if not is_owner(voice_session.owner_id, interaction.user.id):
-                await interaction.response.send_message(
-                    "チャンネルオーナーのみ操作できます。",
-                    ephemeral=True,
-                )
-                return False
-
-        return True
+        return await _ensure_can_control(
+            interaction,
+            self._feature_for_interaction(interaction),
+        )
 
     # =========================================================================
     # Row 0: チャンネル設定 (名前変更・人数制限)
@@ -1254,7 +1469,11 @@ class ControlPanelView(discord.ui.View):
                 # リソースロックにより、並行リクエストによる lost update を防止
                 new_locked_state = not voice_session.is_locked
                 name_edit_failed = False
-                owner_id = int(voice_session.owner_id)
+                owner_id = (
+                    int(voice_session.owner_id)
+                    if voice_session.owner_id is not None
+                    else None
+                )
 
                 if new_locked_state:
                     # ロック: @everyone の接続を拒否
@@ -1270,7 +1489,11 @@ class ControlPanelView(discord.ui.View):
                                 channel, target, connect=False
                             )
                     # オーナーにフル権限を付与
-                    owner = interaction.guild.get_member(owner_id)
+                    owner = (
+                        interaction.guild.get_member(owner_id)
+                        if owner_id is not None
+                        else None
+                    )
                     if owner:
                         await _update_permission_overwrite(
                             channel,
@@ -1282,6 +1505,14 @@ class ControlPanelView(discord.ui.View):
                             mute_members=True,
                             deafen_members=True,
                         )
+                    elif voice_session.owner_id is None:
+                        for member in channel.members:
+                            if not member.bot:
+                                await _update_permission_overwrite(
+                                    channel,
+                                    member,
+                                    connect=True,
+                                )
                     # チャンネル名の先頭に🔒を追加 (まだない場合のみ)
                     if not channel.name.startswith("🔒"):
                         try:
@@ -1314,7 +1545,11 @@ class ControlPanelView(discord.ui.View):
                         channel, interaction.guild.default_role, connect=None
                     )
                     # オーナーのロック用特別権限だけ削除する
-                    owner = interaction.guild.get_member(owner_id)
+                    owner = (
+                        interaction.guild.get_member(owner_id)
+                        if owner_id is not None
+                        else None
+                    )
                     if owner:
                         await _update_permission_overwrite(
                             channel,
@@ -1346,12 +1581,24 @@ class ControlPanelView(discord.ui.View):
                 )
 
                 # Embed を更新
-                owner = interaction.guild.get_member(owner_id)
+                owner = (
+                    interaction.guild.get_member(owner_id)
+                    if owner_id is not None
+                    else None
+                )
                 if owner:
                     embed = create_control_panel_embed(
                         voice_session,
                         owner,
                         user_limit=_get_channel_user_limit(channel),
+                        lobby=_session_lobby(voice_session),
+                    )
+                elif voice_session.owner_id is None:
+                    embed = create_control_panel_embed(
+                        voice_session,
+                        None,
+                        user_limit=_get_channel_user_limit(channel),
+                        lobby=_session_lobby(voice_session),
                     )
                 else:
                     embed = None
@@ -1455,12 +1702,24 @@ class ControlPanelView(discord.ui.View):
                 )
 
                 # Embed を更新
-                owner = interaction.guild.get_member(int(voice_session.owner_id))
+                owner = (
+                    interaction.guild.get_member(int(voice_session.owner_id))
+                    if voice_session.owner_id is not None
+                    else None
+                )
                 if owner:
                     embed = create_control_panel_embed(
                         voice_session,
                         owner,
                         user_limit=_get_channel_user_limit(channel),
+                        lobby=_session_lobby(voice_session),
+                    )
+                elif voice_session.owner_id is None:
+                    embed = create_control_panel_embed(
+                        voice_session,
+                        None,
+                        user_limit=_get_channel_user_limit(channel),
+                        lobby=_session_lobby(voice_session),
                     )
                 else:
                     embed = None
@@ -1514,12 +1773,24 @@ class ControlPanelView(discord.ui.View):
                 db_session, str(interaction.channel_id)
             )
             if voice_session:
-                owner = interaction.guild.get_member(int(voice_session.owner_id))
+                owner = (
+                    interaction.guild.get_member(int(voice_session.owner_id))
+                    if voice_session.owner_id is not None
+                    else None
+                )
                 if owner:
                     embed = create_control_panel_embed(
                         voice_session,
                         owner,
                         user_limit=_get_channel_user_limit(channel),
+                        lobby=_session_lobby(voice_session),
+                    )
+                elif voice_session.owner_id is None:
+                    embed = create_control_panel_embed(
+                        voice_session,
+                        None,
+                        user_limit=_get_channel_user_limit(channel),
+                        lobby=_session_lobby(voice_session),
                     )
                 else:
                     embed = None

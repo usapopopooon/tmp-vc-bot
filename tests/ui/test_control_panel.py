@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 import pytest
 
+from src.database.models import Lobby
 from src.ui.control_panel import (
     CONTROL_PANEL_COOLDOWN_SECONDS,
     AllowSelectView,
@@ -83,6 +84,32 @@ def _make_voice_session(
     vs.is_locked = is_locked
     vs.is_hidden = is_hidden
     return vs
+
+
+def _make_lobby(**overrides: object) -> Lobby:
+    """Create a Lobby model with configurable control settings."""
+    values = {
+        "guild_id": "1",
+        "lobby_channel_id": "2",
+        "naming_mode": "personal",
+        "owner_mode": "owner",
+        "control_policy": "owner",
+        "allow_rename": True,
+        "allow_limit": True,
+        "allow_bitrate": True,
+        "allow_region": True,
+        "allow_lock": True,
+        "allow_hide": True,
+        "allow_nsfw": True,
+        "allow_transfer": True,
+        "allow_kick": True,
+        "allow_dissolve": True,
+        "allow_block": True,
+        "allow_allow": True,
+        "allow_camera": True,
+    }
+    values.update(overrides)
+    return Lobby(**values)
 
 
 def _make_interaction(
@@ -287,6 +314,81 @@ class TestInteractionCheck:
         ):
             result = await view.interaction_check(interaction)
             assert result is False
+
+    async def test_disabled_feature_rejected_even_for_owner(self) -> None:
+        """古いボタン操作でも、無効化された機能は実行できない。"""
+        lobby = _make_lobby(allow_limit=False)
+        view = ControlPanelView(session_id=1, lobby=lobby)
+        interaction = _make_interaction(user_id=1)
+        interaction.data = {"custom_id": "limit_button"}
+        voice_session = _make_voice_session(owner_id="1")
+        voice_session.lobby = lobby
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            result = await view.interaction_check(interaction)
+
+        assert result is False
+        msg = interaction.response.send_message.call_args.args[0]
+        assert "無効" in msg
+
+    async def test_members_policy_allows_current_vc_member(self) -> None:
+        """members policy では現在 VC にいるメンバーが操作できる。"""
+        lobby = _make_lobby(owner_mode="none", control_policy="members")
+        view = ControlPanelView(session_id=1, lobby=lobby)
+        interaction = _make_interaction(user_id=2)
+        interaction.data = {"custom_id": "limit_button"}
+        interaction.user.guild_permissions.administrator = False
+        interaction.user.voice = MagicMock()
+        interaction.user.voice.channel = interaction.channel
+        voice_session = _make_voice_session(owner_id=None)
+        voice_session.lobby = lobby
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            result = await view.interaction_check(interaction)
+
+        assert result is True
+
+    async def test_members_policy_rejects_user_outside_vc(self) -> None:
+        """members policy でも VC 外の一般ユーザーは操作できない。"""
+        lobby = _make_lobby(owner_mode="none", control_policy="members")
+        view = ControlPanelView(session_id=1, lobby=lobby)
+        interaction = _make_interaction(user_id=2)
+        interaction.data = {"custom_id": "limit_button"}
+        interaction.user.guild_permissions.administrator = False
+        interaction.user.voice = None
+        voice_session = _make_voice_session(owner_id=None)
+        voice_session.lobby = lobby
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            result = await view.interaction_check(interaction)
+
+        assert result is False
+        msg = interaction.response.send_message.call_args.args[0]
+        assert "参加" in msg
 
 
 class TestOwnerOnlyEphemeralViews:
@@ -1413,6 +1515,31 @@ class TestControlPanelViewInit:
         """永続 View なので timeout=None。"""
         view = ControlPanelView(session_id=1)
         assert view.timeout is None
+
+    async def test_limit_only_lobby_shows_only_limit_button(self) -> None:
+        """人数のみロビーでは人数制限ボタンだけを表示する。"""
+        lobby = _make_lobby(
+            owner_mode="none",
+            control_policy="members",
+            allow_rename=False,
+            allow_limit=True,
+            allow_bitrate=False,
+            allow_region=False,
+            allow_lock=False,
+            allow_hide=False,
+            allow_nsfw=False,
+            allow_transfer=False,
+            allow_kick=False,
+            allow_dissolve=False,
+            allow_block=False,
+            allow_allow=False,
+            allow_camera=False,
+        )
+
+        view = ControlPanelView(session_id=1, lobby=lobby)
+
+        custom_ids = {item.custom_id for item in view.children}
+        assert custom_ids == {"limit_button"}
 
     async def test_session_id_stored(self) -> None:
         """session_id が保存される。"""
@@ -2543,6 +2670,56 @@ class TestLockButtonOwnerPermissions:
             interaction.guild.default_role,
             "connect",
             False,
+        )
+
+    async def test_ownerless_lock_preserves_current_members_for_admin_policy(
+        self,
+    ) -> None:
+        """オーナーなしロックでは管理者操作でも在室メンバーを許可する。"""
+        view = ControlPanelView(session_id=1)
+        interaction = _make_interaction(user_id=1)
+        interaction.edit_original_response = AsyncMock()
+        interaction.channel.overwrites = {}
+
+        member = MagicMock(spec=discord.Member)
+        member.bot = False
+        interaction.channel.members = [member]
+        interaction.guild.get_member = MagicMock(return_value=None)
+
+        lobby = _make_lobby(owner_mode="none", control_policy="admins")
+        voice_session = _make_voice_session(owner_id=None, is_locked=False)
+        voice_session.lobby = lobby
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+            patch(
+                "src.ui.control_panel.update_voice_session",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "src.ui.control_panel.create_control_panel_embed",
+                return_value=MagicMock(spec=discord.Embed),
+            ),
+        ):
+            await view.lock_button.callback(interaction)
+
+        _assert_permission_field(
+            interaction.channel.set_permissions,
+            interaction.guild.default_role,
+            "connect",
+            False,
+        )
+        _assert_permission_field(
+            interaction.channel.set_permissions,
+            member,
+            "connect",
+            True,
         )
 
     async def test_lock_also_denies_role_permissions(self) -> None:

@@ -76,6 +76,42 @@ class TestLobbyOperations:
         assert lobby.category_id == "789"
         assert lobby.default_user_limit == 10
 
+    async def test_create_configurable_lobby(self, db_session: AsyncSession) -> None:
+        """設定付きロビーを作成できる。"""
+        lobby = await create_lobby(
+            db_session,
+            guild_id="123",
+            lobby_channel_id="456",
+            naming_mode="numbered",
+            room_prefix="作業空間",
+            number_style="full",
+            number_match_mode="both",
+            start_number=1,
+            owner_mode="none",
+            control_policy="members",
+            allow_rename=False,
+            allow_limit=True,
+            allow_bitrate=False,
+            allow_region=False,
+            allow_lock=False,
+            allow_hide=False,
+            allow_nsfw=False,
+            allow_transfer=False,
+            allow_kick=False,
+            allow_dissolve=False,
+            allow_block=False,
+            allow_allow=False,
+            allow_camera=False,
+        )
+
+        assert lobby.naming_mode == "numbered"
+        assert lobby.room_prefix == "作業空間"
+        assert lobby.number_style == "full"
+        assert lobby.owner_mode == "none"
+        assert lobby.control_policy == "members"
+        assert lobby.allow_limit is True
+        assert lobby.allow_rename is False
+
     async def test_get_lobby_by_channel_id(self, db_session: AsyncSession) -> None:
         """Test getting a lobby by channel ID."""
         await create_lobby(db_session, guild_id="123", lobby_channel_id="456")
@@ -135,6 +171,32 @@ class TestVoiceSessionOperations:
         assert session.channel_id == "789"
         assert session.owner_id == "111"
         assert session.name == "Test Channel"
+
+    async def test_create_ownerless_numbered_voice_session(
+        self, db_session: AsyncSession
+    ) -> None:
+        """オーナーなし連番セッションを保存できる。"""
+        lobby = await create_lobby(
+            db_session,
+            guild_id="123",
+            lobby_channel_id="456",
+            naming_mode="numbered",
+            room_prefix="作業空間",
+            owner_mode="none",
+            control_policy="members",
+        )
+
+        session = await create_voice_session(
+            db_session,
+            lobby_id=lobby.id,
+            channel_id="789",
+            owner_id=None,
+            name="作業空間1",
+            sequence_number=1,
+        )
+
+        assert session.owner_id is None
+        assert session.sequence_number == 1
 
     async def test_get_voice_session(self, db_session: AsyncSession) -> None:
         """Test getting a voice session."""

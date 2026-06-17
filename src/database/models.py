@@ -27,6 +27,14 @@ from sqlalchemy.orm import (
     validates,
 )
 
+from src.core.lobby_config import (
+    LOBBY_CONTROL_OWNER,
+    LOBBY_NAMING_PERSONAL,
+    LOBBY_OWNER_MODE_OWNER,
+    NUMBER_MATCH_BOTH,
+    NUMBER_STYLE_HALF,
+)
+
 
 def _validate_discord_id(value: str, field_name: str) -> str:
     """Discord ID (数字文字列) のバリデーション。"""
@@ -57,6 +65,36 @@ class Lobby(Base):
     )
     category_id: Mapped[str | None] = mapped_column(String, nullable=True)
     default_user_limit: Mapped[int] = mapped_column(Integer, default=0)
+    naming_mode: Mapped[str] = mapped_column(
+        String, nullable=False, default=LOBBY_NAMING_PERSONAL
+    )
+    room_prefix: Mapped[str | None] = mapped_column(String, nullable=True)
+    number_style: Mapped[str] = mapped_column(
+        String, nullable=False, default=NUMBER_STYLE_HALF
+    )
+    number_match_mode: Mapped[str] = mapped_column(
+        String, nullable=False, default=NUMBER_MATCH_BOTH
+    )
+    start_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    owner_mode: Mapped[str] = mapped_column(
+        String, nullable=False, default=LOBBY_OWNER_MODE_OWNER
+    )
+    control_policy: Mapped[str] = mapped_column(
+        String, nullable=False, default=LOBBY_CONTROL_OWNER
+    )
+    allow_rename: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_limit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_bitrate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_region: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_lock: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_hide: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_nsfw: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_transfer: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_kick: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_dissolve: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_block: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_allow: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    allow_camera: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     sessions: Mapped[list["VoiceSession"]] = relationship(
         "VoiceSession", back_populates="lobby", cascade="all, delete-orphan"
@@ -81,6 +119,9 @@ class VoiceSession(Base):
     """
 
     __tablename__ = "voice_sessions"
+    __table_args__ = (
+        UniqueConstraint("lobby_id", "sequence_number", name="uq_lobby_sequence"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     lobby_id: Mapped[int] = mapped_column(
@@ -89,8 +130,9 @@ class VoiceSession(Base):
     channel_id: Mapped[str] = mapped_column(
         String, nullable=False, unique=True, index=True
     )
-    owner_id: Mapped[str] = mapped_column(String, nullable=False)
+    owner_id: Mapped[str | None] = mapped_column(String, nullable=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
+    sequence_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_locked: Mapped[bool] = mapped_column(Boolean, default=False)
     is_hidden: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -100,7 +142,12 @@ class VoiceSession(Base):
     lobby: Mapped["Lobby"] = relationship("Lobby", back_populates="sessions")
 
     @validates("channel_id", "owner_id")
-    def _validate_ids(self, key: str, value: str) -> str:
+    def _validate_ids(self, key: str, value: str | None) -> str | None:
+        if key == "owner_id" and value is None:
+            return value
+        if value is None:
+            msg = f"{key} must be a digit string, got: {value!r}"
+            raise ValueError(msg)
         return _validate_discord_id(value, key)
 
     def __repr__(self) -> str:
