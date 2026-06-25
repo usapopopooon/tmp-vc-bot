@@ -28,13 +28,14 @@ Discord の **一時ボイスチャンネル (Ephemeral VC) 機能だけ** を�
 
 - Python 3.12
 - PostgreSQL 17 (asyncpg)
-- Discord Bot トークン (Developer Portal)
+- Discord Bot トークン (Developer Portal)。複数 Bot アカウントで動かす場合は複数のトークン
 
 ## セットアップ
 
 ```bash
 cp .env.example .env
 # .env を編集して DISCORD_TOKEN を設定
+# 複数 Bot を 1 プロセスで動かす場合は DISCORD_TOKENS=token1,token2 も利用可
 # make run でホストから直接起動する場合だけ DATABASE_URL も localhost 向けに設定
 make setup
 make ci          # lint + type check
@@ -64,6 +65,19 @@ make test-db-stop                     # テスト用 PostgreSQL を停止
 
 bot 自体は 1 プロセスで全サーバーを捌くので、**インストール先のサーバーを増やすだけ** で
 追加運用ができます (再デプロイ不要)。
+
+### 複数 Bot アカウント運用
+
+`DISCORD_TOKEN` は従来どおり単一 Bot 用として使える。複数の Bot アカウントを
+1 プロセスで同時起動したい場合は、`DISCORD_TOKENS` にカンマ区切りで指定する:
+
+```bash
+DISCORD_TOKENS=token_for_bot_a,token_for_bot_b,token_for_bot_c
+```
+
+`DISCORD_TOKEN` と `DISCORD_TOKENS` は両方指定でき、重複したトークンは自動で除外される。
+互換性のため、単数の `DISCORD_TOKEN` だけを設定した既存デプロイはそのまま 1 Bot として起動する。
+複数 Bot 分の Gateway 接続とキャッシュを持つため、台数を増やす場合は `BOT_MEMORY_LIMIT` も余裕を持たせる。
 
 ### 招待 URL
 
@@ -106,6 +120,8 @@ Coolify の環境変数に最低限以下を設定する:
 
 ```bash
 DISCORD_TOKEN=...
+# 複数 Bot アカウントの場合:
+# DISCORD_TOKENS=token_for_bot_a,token_for_bot_b
 POSTGRES_PASSWORD=強いランダム文字列
 ```
 
@@ -117,6 +133,7 @@ POSTGRES_USER=tmp_vc_bot
 POSTGRES_DB=tmp_vc_bot
 POSTGRES_HOST=db
 DATABASE_URL=
+DISCORD_TOKENS=
 LOG_LEVEL=INFO
 SYNC_GUILD_IDS=
 SYNC_GUILD_ID=
@@ -144,7 +161,8 @@ POSTGRES_SHARED_BUFFERS=16MB
 
 `railway.toml` がリポジトリにあるので、Railway から GitHub リポを連携するだけで
 Dockerfile を使ってデプロイされる。`DISCORD_TOKEN` と `DATABASE_URL`
-(Railway の Postgres プラグイン) を環境変数に設定する。
+(Railway の Postgres プラグイン) を環境変数に設定する。複数 Bot アカウントで動かす場合は
+`DISCORD_TOKENS` にカンマ区切りで追加する。
 
 ### Heroku
 
@@ -154,6 +172,8 @@ Dockerfile を使ってデプロイされる。`DISCORD_TOKEN` と `DATABASE_URL
 heroku create
 heroku addons:create heroku-postgresql:essential-0
 heroku config:set DISCORD_TOKEN=...
+# 複数 Bot アカウントの場合:
+# heroku config:set DISCORD_TOKENS=token_for_bot_a,token_for_bot_b
 git push heroku main
 ```
 
@@ -162,7 +182,7 @@ git push heroku main
 ```
 src/
 ├── bot.py               # Bot クラス (EphemeralVCBot)
-├── main.py              # エントリーポイント
+├── main.py              # エントリーポイント (複数 Bot 起動)
 ├── config.py            # pydantic-settings 設定
 ├── constants.py
 ├── utils.py             # リソースロック

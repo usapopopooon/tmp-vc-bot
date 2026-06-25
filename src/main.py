@@ -23,6 +23,7 @@ Notes:
     環境変数:
 
     - DISCORD_TOKEN: Discord Bot トークン (必須)
+    - DISCORD_TOKENS: 複数 Bot 用 Discord Bot トークン (カンマ区切り、任意)
     - DATABASE_URL: DB 接続 URL
     - LOG_LEVEL: ログレベル (DEBUG, INFO, WARNING, ERROR, CRITICAL)。デフォルト: INFO
 """
@@ -66,33 +67,44 @@ _setup_logging()
 logger = logging.getLogger(__name__)
 
 #: グローバル変数として Bot インスタンスを保持。シグナルハンドラから参照する。
-_bot: EphemeralVCBot | None = None
+_bots: list[EphemeralVCBot] = []
+_shutdown_requested = False
 
 
 def _handle_shutdown_signal(signum: int, _frame: FrameType | None) -> None:
     """シャットダウンシグナルハンドラ (SIGTERM/SIGINT)。"""
+    global _shutdown_requested
+
     try:
         sig_name = signal.Signals(signum).name
     except ValueError:
         sig_name = str(signum)
 
+    _shutdown_requested = True
     logger.info("Received %s signal, initiating graceful shutdown...", sig_name)
 
-    if _bot is not None:
+    if _bots:
         try:
-            asyncio.create_task(_shutdown_bot())
+            asyncio.create_task(_shutdown_bots())
         except RuntimeError:
             logger.warning("Event loop not running, forcing shutdown")
             sys.exit(0)
 
 
-async def _shutdown_bot() -> None:
+async def _shutdown_bots() -> None:
     """Bot を graceful に停止する。"""
-    global _bot
-    if _bot is not None:
-        logger.info("Closing bot connection...")
-        await _bot.close()
-        logger.info("Bot closed successfully")
+    if not _bots:
+        return
+
+    logger.info("Closing %d bot connection(s)...", len(_bots))
+    results = await asyncio.gather(
+        *(bot.close() for bot in _bots if not bot.is_closed()),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, Exception):
+            logger.warning("Bot close failed: %s", result)
+    logger.info("Bot connection(s) closed successfully")
 
 
 def _run_migrations() -> None:
@@ -103,9 +115,33 @@ def _run_migrations() -> None:
     logger.info("alembic upgrade head completed")
 
 
+async def _run_bot(token: str, bot: EphemeralVCBot) -> None:
+    """1 つの Discord Bot トークンで Bot を起動する。"""
+    async with bot:
+        await bot.start(token)
+
+
+def _log_bot_task_result(task: asyncio.Future[None]) -> None:
+    """Bot タスクが異常終了したら即時ログに出す。"""
+    if task.cancelled():
+        return
+
+    exc = task.exception()
+    if exc is None:
+        return
+
+    name = task.get_name() if isinstance(task, asyncio.Task) else "bot task"
+    logger.error(
+        "%s stopped with an error",
+        name,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+
+
 async def main() -> None:
     """Bot のメインエントリーポイント。DB → migration → シグナル → Bot 起動。"""
-    global _bot
+    global _bots, _shutdown_requested
+    _shutdown_requested = False
 
     # データベース接続チェック (リトライ付き)
     if not await check_database_connection_with_retry():
@@ -142,9 +178,24 @@ async def main() -> None:
         except (ValueError, OSError) as e:
             logger.warning("Could not register SIGPIPE handler: %s", e)
 
-    _bot = EphemeralVCBot()
-    async with _bot:
-        await _bot.start(settings.discord_token)
+    tokens = settings.discord_tokens
+    logger.info("Starting %d bot instance(s)", len(tokens))
+    _bots = [EphemeralVCBot() for _ in tokens]
+    tasks = [
+        asyncio.create_task(_run_bot(token, bot), name=f"bot-start-{index}")
+        for index, (token, bot) in enumerate(zip(tokens, _bots, strict=True), start=1)
+    ]
+    for task in tasks:
+        task.add_done_callback(_log_bot_task_result)
+
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures and not _shutdown_requested:
+            raise RuntimeError(f"{len(failures)} bot instance(s) stopped with an error")
+    finally:
+        await _shutdown_bots()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":
