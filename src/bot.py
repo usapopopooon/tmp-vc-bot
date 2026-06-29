@@ -48,7 +48,7 @@ class EphemeralVCBot(commands.Bot):
         intents.guilds = True
         intents.members = True
 
-        activity = discord.Game(name="一時 VC を管理しています")
+        activity = discord.Game(name="VCを管理しています")
 
         super().__init__(
             command_prefix="!",
@@ -151,7 +151,7 @@ class EphemeralVCBot(commands.Bot):
         try:
             await self.change_presence(
                 status=discord.Status.online,
-                activity=discord.Game(name="一時 VC を管理しています"),
+                activity=discord.Game(name="VCを管理しています"),
             )
         except discord.HTTPException as e:
             logger.warning("Failed to change_presence in on_ready: %s", e)
