@@ -15,6 +15,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -181,6 +182,126 @@ class VoiceSessionMember(Base):
         return (
             f"<VoiceSessionMember(id={self.id}, session_id={self.voice_session_id}, "
             f"user_id={self.user_id}, joined_at={self.joined_at})>"
+        )
+
+
+class VoiceNotifyConfig(Base):
+    """VC 単位の入退室通知設定テーブル。"""
+
+    __tablename__ = "voice_notify_configs"
+    __table_args__ = (
+        UniqueConstraint(
+            "guild_id",
+            "voice_channel_id",
+            name="uq_voice_notify_guild_voice_channel",
+        ),
+        Index("ix_voice_notify_configs_guild_id", "guild_id"),
+        Index("ix_voice_notify_configs_notify_channel_id", "notify_channel_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    guild_id: Mapped[str] = mapped_column(String, nullable=False)
+    voice_channel_id: Mapped[str] = mapped_column(String, nullable=False)
+    notify_channel_id: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    @validates("guild_id", "voice_channel_id", "notify_channel_id")
+    def _validate_ids(self, key: str, value: str) -> str:
+        return _validate_discord_id(value, key)
+
+    def __repr__(self) -> str:
+        return (
+            f"<VoiceNotifyConfig(id={self.id}, guild_id={self.guild_id}, "
+            f"voice_channel_id={self.voice_channel_id}, "
+            f"notify_channel_id={self.notify_channel_id})>"
+        )
+
+
+class VoiceNotifyCategoryConfig(Base):
+    """カテゴリ単位の VC 入退室通知設定テーブル。"""
+
+    __tablename__ = "voice_notify_category_configs"
+    __table_args__ = (
+        UniqueConstraint(
+            "guild_id",
+            "category_id",
+            name="uq_voice_notify_category_guild_category",
+        ),
+        Index("ix_voice_notify_category_configs_guild_id", "guild_id"),
+        Index(
+            "ix_voice_notify_category_configs_notify_channel_id",
+            "notify_channel_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    guild_id: Mapped[str] = mapped_column(String, nullable=False)
+    category_id: Mapped[str] = mapped_column(String, nullable=False)
+    notify_channel_id: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    @validates("guild_id", "category_id", "notify_channel_id")
+    def _validate_ids(self, key: str, value: str) -> str:
+        return _validate_discord_id(value, key)
+
+    def __repr__(self) -> str:
+        return (
+            f"<VoiceNotifyCategoryConfig(id={self.id}, guild_id={self.guild_id}, "
+            f"category_id={self.category_id}, "
+            f"notify_channel_id={self.notify_channel_id})>"
+        )
+
+
+class VoiceNotifyExclude(Base):
+    """カテゴリ通知から除外する VC テーブル。"""
+
+    __tablename__ = "voice_notify_excludes"
+    __table_args__ = (
+        UniqueConstraint(
+            "guild_id",
+            "voice_channel_id",
+            name="uq_voice_notify_exclude_guild_voice_channel",
+        ),
+        Index("ix_voice_notify_excludes_guild_id", "guild_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    guild_id: Mapped[str] = mapped_column(String, nullable=False)
+    voice_channel_id: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    @validates("guild_id", "voice_channel_id")
+    def _validate_ids(self, key: str, value: str) -> str:
+        return _validate_discord_id(value, key)
+
+    def __repr__(self) -> str:
+        return (
+            f"<VoiceNotifyExclude(id={self.id}, guild_id={self.guild_id}, "
+            f"voice_channel_id={self.voice_channel_id})>"
         )
 
 

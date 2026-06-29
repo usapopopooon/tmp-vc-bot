@@ -17,6 +17,7 @@ from src.cogs.voice import (
     _cleanup_vc_create_cooldown_cache,
     _vc_create_cooldown_cache,
     clear_vc_create_cooldown_cache,
+    create_voice_notify_message,
     is_vc_create_on_cooldown,
     record_vc_create_cooldown,
 )
@@ -80,6 +81,8 @@ def _make_channel(channel_id: int, members: list[MagicMock] | None = None) -> Ma
     channel = MagicMock(spec=discord.VoiceChannel)
     channel.id = channel_id
     channel.members = members or []
+    channel.guild = MagicMock(spec=discord.Guild)
+    channel.guild.id = 1000
     return channel
 
 
@@ -362,6 +365,10 @@ class TestOnGuildChannelDelete:
             patch(
                 "src.cogs.voice.delete_voice_session", new_callable=AsyncMock
             ) as mock_delete,
+            patch(
+                "src.cogs.voice.delete_voice_notify_by_channel",
+                new_callable=AsyncMock,
+            ) as mock_delete_notify,
             patch("src.cogs.voice.async_session", mock_factory),
             patch(
                 "src.cogs.voice.get_lobby_by_channel_id",
@@ -371,20 +378,32 @@ class TestOnGuildChannelDelete:
         ):
             await cog.on_guild_channel_delete(channel)
 
+            mock_delete_notify.assert_awaited_once_with(mock_session, "1000", "100")
             mock_delete.assert_awaited_once_with(mock_session, "100")
         # メモリ上の参加記録もクリーンアップされる
         assert 100 not in cog._join_times
 
     async def test_ignores_non_voice_channel(self) -> None:
-        """Test that text channel deletion is ignored."""
+        """Text channel deletion only cleans up voice notify settings."""
         cog = _make_cog()
         text_channel = MagicMock(spec=discord.TextChannel)
         text_channel.id = 200
+        text_channel.guild = MagicMock(spec=discord.Guild)
+        text_channel.guild.id = 1000
 
-        with patch(
-            "src.cogs.voice.delete_voice_session", new_callable=AsyncMock
-        ) as mock_delete:
+        mock_factory, mock_session = _mock_async_session()
+        with (
+            patch(
+                "src.cogs.voice.delete_voice_notify_by_channel",
+                new_callable=AsyncMock,
+            ) as mock_delete_notify,
+            patch(
+                "src.cogs.voice.delete_voice_session", new_callable=AsyncMock
+            ) as mock_delete,
+            patch("src.cogs.voice.async_session", mock_factory),
+        ):
             await cog.on_guild_channel_delete(text_channel)
+            mock_delete_notify.assert_awaited_once_with(mock_session, "1000", "200")
             mock_delete.assert_not_awaited()
 
     async def test_no_error_when_no_session_exists(self) -> None:
@@ -397,6 +416,10 @@ class TestOnGuildChannelDelete:
             patch(
                 "src.cogs.voice.delete_voice_session", new_callable=AsyncMock
             ) as mock_delete,
+            patch(
+                "src.cogs.voice.delete_voice_notify_by_channel",
+                new_callable=AsyncMock,
+            ),
             patch("src.cogs.voice.async_session", mock_factory),
             patch(
                 "src.cogs.voice.get_lobby_by_channel_id",
@@ -419,6 +442,10 @@ class TestOnGuildChannelDelete:
         mock_factory, mock_session = _mock_async_session()
         with (
             patch("src.cogs.voice.delete_voice_session", new_callable=AsyncMock),
+            patch(
+                "src.cogs.voice.delete_voice_notify_by_channel",
+                new_callable=AsyncMock,
+            ),
             patch("src.cogs.voice.async_session", mock_factory),
             patch(
                 "src.cogs.voice.get_lobby_by_channel_id",
@@ -442,6 +469,10 @@ class TestOnGuildChannelDelete:
         mock_factory, mock_session = _mock_async_session()
         with (
             patch("src.cogs.voice.delete_voice_session", new_callable=AsyncMock),
+            patch(
+                "src.cogs.voice.delete_voice_notify_by_channel",
+                new_callable=AsyncMock,
+            ),
             patch("src.cogs.voice.async_session", mock_factory),
             patch(
                 "src.cogs.voice.get_lobby_by_channel_id",
@@ -1425,6 +1456,7 @@ class TestOnVoiceStateUpdate:
         after.channel = _make_channel(100)
 
         cog._handle_lobby_join = AsyncMock()  # type: ignore[method-assign]
+        cog._handle_voice_notify_state_update = AsyncMock()  # type: ignore[method-assign]
         cog._record_join_to_db = AsyncMock()  # type: ignore[method-assign]
 
         await cog.on_voice_state_update(member, before, after)
@@ -1445,6 +1477,7 @@ class TestOnVoiceStateUpdate:
         after.channel = None
 
         cog._handle_channel_leave = AsyncMock()  # type: ignore[method-assign]
+        cog._handle_voice_notify_state_update = AsyncMock()  # type: ignore[method-assign]
         cog._remove_join_from_db = AsyncMock()  # type: ignore[method-assign]
 
         await cog.on_voice_state_update(member, before, after)
@@ -1466,11 +1499,157 @@ class TestOnVoiceStateUpdate:
 
         cog._handle_lobby_join = AsyncMock()  # type: ignore[method-assign]
         cog._handle_channel_leave = AsyncMock()  # type: ignore[method-assign]
+        cog._handle_voice_notify_state_update = AsyncMock()  # type: ignore[method-assign]
 
         await cog.on_voice_state_update(member, before, after)
 
         cog._handle_lobby_join.assert_not_awaited()
         cog._handle_channel_leave.assert_not_awaited()
+
+
+# ===========================================================================
+# VC 入退室通知テスト
+# ===========================================================================
+
+
+class TestVoiceNotify:
+    """Tests for VC join/leave notification helpers."""
+
+    def test_create_voice_notify_message_escapes_display_name(self) -> None:
+        """通知本文では表示名の Markdown をエスケープする。"""
+        member = _make_member(1)
+        member.display_name = "*ほげ*"
+
+        message = create_voice_notify_message(member, "100", "join")
+
+        assert message == r"\*ほげ\* さんが <#100> に入室しました。"
+
+    async def test_handle_voice_notify_sends_leave_then_join(self) -> None:
+        """VC 移動時は退出通知のあとに入室通知を処理する。"""
+        cog = _make_cog()
+        member = _make_member(1)
+        member.guild = MagicMock(spec=discord.Guild)
+        member.guild.id = 1000
+
+        before_channel = _make_channel(100)
+        after_channel = _make_channel(200)
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = before_channel
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = after_channel
+
+        cog._send_voice_notification = AsyncMock()  # type: ignore[method-assign]
+
+        await cog._handle_voice_notify_state_update(member, before, after)
+
+        assert cog._send_voice_notification.await_args_list[0].args == (
+            member.guild,
+            member,
+            before_channel,
+            "leave",
+        )
+        assert cog._send_voice_notification.await_args_list[1].args == (
+            member.guild,
+            member,
+            after_channel,
+            "join",
+        )
+
+    async def test_send_voice_notification_deduplicates_direct_and_category(
+        self,
+    ) -> None:
+        """同じ通知先への個別 VC 通知とカテゴリ通知は 1 通にまとめる。"""
+        cog = _make_cog()
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 1000
+        notify_channel = MagicMock(spec=discord.TextChannel)
+        notify_channel.id = 300
+        notify_channel.send = AsyncMock()
+        guild.get_channel = MagicMock(return_value=notify_channel)
+
+        voice_channel = _make_channel(100)
+        voice_channel.category_id = 200
+        member = _make_member(1)
+        member.display_name = "ほげほげ"
+
+        direct_config = MagicMock()
+        direct_config.notify_channel_id = "300"
+        category_config = MagicMock()
+        category_config.notify_channel_id = "300"
+        mock_factory, mock_session = _mock_async_session()
+
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.list_voice_notify_configs_by_voice_channel",
+                new_callable=AsyncMock,
+                return_value=[direct_config],
+            ) as mock_list,
+            patch(
+                "src.cogs.voice.is_voice_notify_excluded",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as mock_is_excluded,
+            patch(
+                "src.cogs.voice.get_voice_notify_category_config",
+                new_callable=AsyncMock,
+                return_value=category_config,
+            ),
+        ):
+            sent = await cog._send_voice_notification(
+                guild,
+                member,
+                voice_channel,
+                "join",
+            )
+
+        assert sent is True
+        mock_list.assert_awaited_once_with(mock_session, "1000", "100")
+        mock_is_excluded.assert_awaited_once_with(mock_session, "1000", "100")
+        notify_channel.send.assert_awaited_once()
+        assert notify_channel.send.call_args.args[0] == (
+            "ほげほげ さんが <#100> に入室しました。"
+        )
+
+    async def test_send_voice_notification_skips_excluded_category(self) -> None:
+        """カテゴリ除外された VC はカテゴリ通知だけ送らない。"""
+        cog = _make_cog()
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 1000
+        guild.get_channel = MagicMock()
+        voice_channel = _make_channel(100)
+        voice_channel.category_id = 200
+        member = _make_member(1)
+        mock_factory, mock_session = _mock_async_session()
+
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.list_voice_notify_configs_by_voice_channel",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "src.cogs.voice.is_voice_notify_excluded",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_is_excluded,
+            patch(
+                "src.cogs.voice.get_voice_notify_category_config",
+                new_callable=AsyncMock,
+            ) as mock_get_category,
+        ):
+            sent = await cog._send_voice_notification(
+                guild,
+                member,
+                voice_channel,
+                "join",
+            )
+
+        assert sent is False
+        mock_is_excluded.assert_awaited_once_with(mock_session, "1000", "100")
+        mock_get_category.assert_not_awaited()
+        guild.get_channel.assert_not_called()
 
 
 # ===========================================================================
@@ -2437,6 +2616,7 @@ class TestOnVoiceStateUpdateEdgeCases:
 
         cog._handle_lobby_join = AsyncMock()  # type: ignore[method-assign]
         cog._handle_channel_leave = AsyncMock()  # type: ignore[method-assign]
+        cog._handle_voice_notify_state_update = AsyncMock()  # type: ignore[method-assign]
         cog._record_join_to_db = AsyncMock()  # type: ignore[method-assign]
         cog._remove_join_from_db = AsyncMock()  # type: ignore[method-assign]
 
@@ -2461,6 +2641,7 @@ class TestOnVoiceStateUpdateEdgeCases:
         after.channel.id = 300
 
         cog._handle_lobby_join = AsyncMock()  # type: ignore[method-assign]
+        cog._handle_voice_notify_state_update = AsyncMock()  # type: ignore[method-assign]
 
         await cog.on_voice_state_update(member, before, after)
 
@@ -2478,6 +2659,7 @@ class TestOnVoiceStateUpdateEdgeCases:
         after.channel = None
 
         cog._handle_channel_leave = AsyncMock()  # type: ignore[method-assign]
+        cog._handle_voice_notify_state_update = AsyncMock()  # type: ignore[method-assign]
 
         await cog.on_voice_state_update(member, before, after)
 
@@ -2538,6 +2720,7 @@ class TestEnforceChannelRestrictions:
         voice_session = _make_voice_session(
             channel_id="100", owner_id="1", is_locked=True
         )
+        cog._handle_voice_notify_state_update = AsyncMock()  # type: ignore[method-assign]
 
         mock_factory, _ = _mock_async_session()
         with (
@@ -3387,6 +3570,7 @@ class TestVoiceCogWithParametrize:
         after.channel = after_channel
 
         cog._handle_lobby_join = AsyncMock()  # type: ignore[method-assign]
+        cog._handle_voice_notify_state_update = AsyncMock()  # type: ignore[method-assign]
         cog._record_join_to_db = AsyncMock()  # type: ignore[method-assign]
         cog._enforce_channel_restrictions = AsyncMock(  # type: ignore[method-assign]
             return_value=False
@@ -3942,17 +4126,20 @@ class TestOnGuildRemove:
     """on_guild_remove リスナーのテスト。"""
 
     @patch("src.cogs.voice.async_session")
+    @patch("src.cogs.voice.delete_voice_notify_by_guild")
     @patch("src.cogs.voice.delete_voice_sessions_by_guild")
     @patch("src.cogs.voice.delete_lobbies_by_guild")
     async def test_deletes_all_voice_data(
         self,
         mock_delete_lobbies: AsyncMock,
         mock_delete_sessions: AsyncMock,
+        mock_delete_notify: AsyncMock,
         mock_session: MagicMock,
     ) -> None:
         """ギルド削除時に全ての VC データを削除する。"""
         cog = _make_cog()
 
+        mock_delete_notify.return_value = 3
         mock_delete_sessions.return_value = 5
         mock_delete_lobbies.return_value = 2
 
@@ -3966,21 +4153,25 @@ class TestOnGuildRemove:
 
         await cog.on_guild_remove(guild)
 
+        mock_delete_notify.assert_called_once()
         mock_delete_sessions.assert_called_once()
         mock_delete_lobbies.assert_called_once()
 
     @patch("src.cogs.voice.async_session")
+    @patch("src.cogs.voice.delete_voice_notify_by_guild")
     @patch("src.cogs.voice.delete_voice_sessions_by_guild")
     @patch("src.cogs.voice.delete_lobbies_by_guild")
     async def test_handles_no_data(
         self,
         mock_delete_lobbies: AsyncMock,
         mock_delete_sessions: AsyncMock,
+        mock_delete_notify: AsyncMock,
         mock_session: MagicMock,
     ) -> None:
         """データがない場合も正常に動作する。"""
         cog = _make_cog()
 
+        mock_delete_notify.return_value = 0
         mock_delete_sessions.return_value = 0
         mock_delete_lobbies.return_value = 0
 
@@ -3994,22 +4185,29 @@ class TestOnGuildRemove:
 
         await cog.on_guild_remove(guild)
 
+        mock_delete_notify.assert_called_once()
         mock_delete_sessions.assert_called_once()
         mock_delete_lobbies.assert_called_once()
 
     @patch("src.cogs.voice.async_session")
+    @patch("src.cogs.voice.delete_voice_notify_by_guild")
     @patch("src.cogs.voice.delete_voice_sessions_by_guild")
     @patch("src.cogs.voice.delete_lobbies_by_guild")
     async def test_deletes_sessions_before_lobbies(
         self,
         mock_delete_lobbies: AsyncMock,
         mock_delete_sessions: AsyncMock,
+        mock_delete_notify: AsyncMock,
         mock_session: MagicMock,
     ) -> None:
-        """外部キー制約のため、セッションがロビーより先に削除される。"""
+        """通知、セッション、ロビーの順に削除される。"""
         cog = _make_cog()
 
         call_order: list[str] = []
+
+        async def track_notify(*_args: object) -> int:
+            call_order.append("notify")
+            return 1
 
         async def track_sessions(*_args: object) -> int:
             call_order.append("sessions")
@@ -4019,6 +4217,7 @@ class TestOnGuildRemove:
             call_order.append("lobbies")
             return 1
 
+        mock_delete_notify.side_effect = track_notify
         mock_delete_sessions.side_effect = track_sessions
         mock_delete_lobbies.side_effect = track_lobbies
 
@@ -4032,8 +4231,7 @@ class TestOnGuildRemove:
 
         await cog.on_guild_remove(guild)
 
-        # セッションが先に削除される
-        assert call_order == ["sessions", "lobbies"]
+        assert call_order == ["notify", "sessions", "lobbies"]
 
 
 # ===========================================================================
@@ -5262,6 +5460,10 @@ class TestOnGuildChannelDeleteCacheDiscard:
         mock_factory, mock_session = _mock_async_session()
         with (
             patch("src.cogs.voice.delete_voice_session", new_callable=AsyncMock),
+            patch(
+                "src.cogs.voice.delete_voice_notify_by_channel",
+                new_callable=AsyncMock,
+            ),
             patch("src.cogs.voice.async_session", mock_factory),
             patch(
                 "src.cogs.voice.get_lobby_by_channel_id",

@@ -19,7 +19,7 @@ import logging
 import time
 import unicodedata
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, TypeGuard
 
 import discord
 from discord import app_commands
@@ -51,21 +51,35 @@ from src.core.lobby_config import (
 from src.database.engine import async_session
 from src.database.models import Lobby, VoiceSession
 from src.services.db_service import (
+    add_voice_notify_exclude,
     add_voice_session_member,
     claim_event,
     create_lobby,
     create_voice_session,
     delete_lobbies_by_guild,
     delete_lobby,
+    delete_voice_notify_by_channel,
+    delete_voice_notify_by_guild,
+    delete_voice_notify_category_config,
+    delete_voice_notify_config,
+    delete_voice_notify_exclude,
     delete_voice_session,
     delete_voice_sessions_by_guild,
     get_all_lobbies,
     get_lobbies_by_guild,
     get_lobby_by_channel_id,
+    get_voice_notify_category_config,
     get_voice_session,
     get_voice_session_members_ordered,
     get_voice_sessions_by_lobby,
+    is_voice_notify_excluded,
+    list_voice_notify_category_configs,
+    list_voice_notify_configs,
+    list_voice_notify_configs_by_voice_channel,
+    list_voice_notify_excludes,
     remove_voice_session_member,
+    set_voice_notify_category_config,
+    set_voice_notify_config,
     update_voice_session,
 )
 from src.ui.control_panel import (
@@ -102,6 +116,10 @@ _FEATURE_OVERRIDE_FIELDS = (
     "allow_allow",
     "allow_camera",
 )
+
+VOICE_NOTIFY_STATUS_LIST_LIMIT = 20
+
+VoiceNotifyEventType = Literal["join", "leave"]
 
 
 @dataclass(frozen=True)
@@ -381,6 +399,72 @@ def _dialog_room_prefix(lobby_name: str, room_prefix: str | None) -> str:
     return _DIALOG_DEFAULT_ROOM_PREFIX
 
 
+def create_voice_notify_message(
+    member: discord.Member,
+    voice_channel_id: int | str,
+    event_type: VoiceNotifyEventType,
+) -> str:
+    """VC 入退室通知の本文を作成する。"""
+    display_name = discord.utils.escape_markdown(member.display_name)
+    if event_type == "join":
+        return f"{display_name} さんが <#{voice_channel_id}> に入室しました。"
+    return f"{display_name} さんが <#{voice_channel_id}> から退室しました。"
+
+
+def _is_voice_notify_voice_channel(
+    channel: object,
+) -> TypeGuard[discord.VoiceChannel | discord.StageChannel]:
+    """VC 入退室通知の監視対象チャンネルかを判定する。"""
+    return isinstance(channel, discord.VoiceChannel | discord.StageChannel)
+
+
+def _is_voice_notify_sendable_channel(
+    channel: object,
+) -> TypeGuard[discord.TextChannel]:
+    """VC 入退室通知の送信先にできるチャンネルかを判定する。"""
+    return isinstance(channel, discord.TextChannel)
+
+
+def _voice_notify_category_id(channel: object) -> str | None:
+    """VC/Stage のカテゴリ ID を文字列で返す。"""
+    category_id = getattr(channel, "category_id", None)
+    if isinstance(category_id, int):
+        return str(category_id)
+    category = getattr(channel, "category", None)
+    category_id = getattr(category, "id", None)
+    if isinstance(category_id, int):
+        return str(category_id)
+    return None
+
+
+def _format_limited_voice_notify_lines(lines: list[str]) -> list[str]:
+    """status 表示の件数を制限する。"""
+    limited = lines[:VOICE_NOTIFY_STATUS_LIST_LIMIT]
+    omitted_count = len(lines) - len(limited)
+    if omitted_count > 0:
+        limited.append(f"ほか {omitted_count} 件")
+    return limited
+
+
+def _can_bot_send_voice_notify(
+    channel: discord.TextChannel,
+    interaction: discord.Interaction,
+) -> bool:
+    """指定チャンネルへ Bot が通知を送れるかを確認する。"""
+    guild = interaction.guild
+    if guild is None:
+        return False
+
+    bot_member = guild.me
+    if bot_member is None and interaction.client.user is not None:
+        bot_member = guild.get_member(interaction.client.user.id)
+    if bot_member is None:
+        return True
+
+    permissions = channel.permissions_for(bot_member)
+    return permissions.view_channel and permissions.send_messages
+
+
 class VoiceCog(commands.Cog):
     """ボイスチャンネルの作成・削除・オーナー管理を行う Cog。
 
@@ -427,6 +511,15 @@ class VoiceCog(commands.Cog):
             before: 変更前の状態 (before.channel = 以前いたチャンネル)
             after: 変更後の状態 (after.channel = 今いるチャンネル)
         """
+        if before.channel != after.channel:
+            try:
+                await self._handle_voice_notify_state_update(member, before, after)
+            except Exception:
+                logger.exception(
+                    "Failed to handle voice notification: member=%s",
+                    member.id,
+                )
+
         # --- 参加処理 ---
         # after.channel が存在し、かつ before と異なる = 新しいチャンネルに参加した
         if (
@@ -465,12 +558,20 @@ class VoiceCog(commands.Cog):
         発火しないため、DB にレコードが残ってしまう (孤立レコード)。
         このリスナーで削除されたチャンネルの DB レコードをクリーンアップする。
         """
+        channel_id_str = str(channel.id)
+        async with async_session() as session:
+            await delete_voice_notify_by_channel(
+                session,
+                str(channel.guild.id),
+                channel_id_str,
+            )
+
         if not isinstance(channel, discord.VoiceChannel):
             return
+
         # メモリキャッシュの参加記録を削除
         self._cleanup_channel_cache(channel.id)
         # DB のレコードをクリーンアップ (存在しなくても安全)
-        channel_id_str = str(channel.id)
         async with async_session() as session:
             await delete_voice_session(session, channel_id_str)
             # ロビーとして登録されていた場合、そのレコードも削除
@@ -490,19 +591,171 @@ class VoiceCog(commands.Cog):
         # 注: ギルドのチャンネルは取得できないため、キャッシュは自然に stale になる
 
         async with async_session() as session:
+            notify_count = await delete_voice_notify_by_guild(session, guild_id)
             # 先にボイスセッションを削除 (外部キー制約のため)
             vs_count = await delete_voice_sessions_by_guild(session, guild_id)
             # 次にロビーを削除
             lobby_count = await delete_lobbies_by_guild(session, guild_id)
 
-        if vs_count > 0 or lobby_count > 0:
+        if notify_count > 0 or vs_count > 0 or lobby_count > 0:
             logger.info(
-                "Cleaned up %d voice session(s) and %d lobby/lobbies "
+                "Cleaned up %d voice notify setting(s), %d voice session(s), "
+                "and %d lobby/lobbies "
                 "for removed guild: guild=%s",
+                notify_count,
                 vs_count,
                 lobby_count,
                 guild_id,
             )
+
+    # ==========================================================================
+    # VC 入退室通知
+    # ==========================================================================
+
+    async def _handle_voice_notify_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """VC 入退室通知の対象イベントを処理する。"""
+        if member.bot or before.channel == after.channel:
+            return
+
+        before_channel = (
+            before.channel
+            if before.channel and _is_voice_notify_voice_channel(before.channel)
+            else None
+        )
+        after_channel = (
+            after.channel
+            if after.channel and _is_voice_notify_voice_channel(after.channel)
+            else None
+        )
+        if before_channel is None and after_channel is None:
+            return
+
+        guild = member.guild
+        if before_channel is not None:
+            await self._send_voice_notification(
+                guild,
+                member,
+                before_channel,
+                "leave",
+            )
+
+        if after_channel is not None:
+            await self._send_voice_notification(
+                guild,
+                member,
+                after_channel,
+                "join",
+            )
+
+    async def _send_voice_notification(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        voice_channel: discord.VoiceChannel | discord.StageChannel,
+        event_type: VoiceNotifyEventType,
+    ) -> bool:
+        """設定に従って VC 入退室通知を送信する。"""
+        guild_id = str(guild.id)
+        voice_channel_id = str(voice_channel.id)
+
+        async with async_session() as session:
+            voice_configs = await list_voice_notify_configs_by_voice_channel(
+                session,
+                guild_id,
+                voice_channel_id,
+            )
+
+            category_config = None
+            category_id = _voice_notify_category_id(voice_channel)
+            if category_id is not None and not await is_voice_notify_excluded(
+                session,
+                guild_id,
+                voice_channel_id,
+            ):
+                category_config = await get_voice_notify_category_config(
+                    session,
+                    guild_id,
+                    category_id,
+                )
+
+        notify_channel_ids: list[str] = []
+        seen_notify_channel_ids: set[str] = set()
+        for config in voice_configs:
+            if config.notify_channel_id in seen_notify_channel_ids:
+                continue
+            seen_notify_channel_ids.add(config.notify_channel_id)
+            notify_channel_ids.append(config.notify_channel_id)
+        if (
+            category_config is not None
+            and category_config.notify_channel_id not in seen_notify_channel_ids
+        ):
+            notify_channel_ids.append(category_config.notify_channel_id)
+
+        if not notify_channel_ids:
+            return False
+
+        content = create_voice_notify_message(member, voice_channel_id, event_type)
+        sent = False
+        for notify_channel_id in notify_channel_ids:
+            channel = await self._fetch_voice_notify_sendable_channel(
+                guild,
+                notify_channel_id,
+            )
+            if channel is None:
+                logger.warning(
+                    "Voice notify channel is not sendable: guild=%s voice=%s notify=%s",
+                    guild_id,
+                    voice_channel_id,
+                    notify_channel_id,
+                )
+                continue
+
+            try:
+                await channel.send(
+                    content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                sent = True
+            except discord.HTTPException as e:
+                logger.warning(
+                    "Failed to send voice notification: guild=%s voice=%s "
+                    "notify=%s error=%s",
+                    guild_id,
+                    voice_channel_id,
+                    notify_channel_id,
+                    e,
+                )
+
+        return sent
+
+    async def _fetch_voice_notify_sendable_channel(
+        self,
+        guild: discord.Guild,
+        channel_id: str,
+    ) -> discord.TextChannel | None:
+        """通知送信可能なテキストチャンネルを取得する。"""
+        try:
+            channel_id_int = int(channel_id)
+        except ValueError:
+            return None
+
+        channel = guild.get_channel(channel_id_int)
+        if _is_voice_notify_sendable_channel(channel):
+            return channel
+
+        try:
+            fetched = await guild.fetch_channel(channel_id_int)
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            return None
+
+        if _is_voice_notify_sendable_channel(fetched):
+            return fetched
+        return None
 
     # ==========================================================================
     # 参加時刻の追跡ヘルパー
@@ -1508,6 +1761,12 @@ class VoiceCog(commands.Cog):
         name="vc",
         description="一時 VC の管理コマンド",
     )
+    voice_notify_group = app_commands.Group(
+        name="voice-notify",
+        description="VC入退室通知を管理します",
+        default_permissions=discord.Permissions(administrator=True),
+        guild_only=True,
+    )
 
     @vc_group.command(name="lobby", description="ロビーVCを作成します")
     @app_commands.describe(dialog="連番共有ロビーをダイアログで設定します")
@@ -1656,6 +1915,260 @@ class VoiceCog(commands.Cog):
         await interaction.response.send_message(
             "コントロールパネルを再投稿しました。", ephemeral=True
         )
+
+    async def _ensure_voice_notify_guild(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        """voice-notify コマンドがサーバー内で実行されたか確認する。"""
+        if interaction.guild is None or interaction.guild_id is None:
+            await interaction.response.send_message(
+                "このコマンドはサーバー内でのみ実行できます。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @voice_notify_group.command(
+        name="add",
+        description="VC入退室通知を追加または更新します",
+    )
+    async def voice_notify_add(
+        self,
+        interaction: discord.Interaction,
+        voice: discord.VoiceChannel | discord.StageChannel,
+        notify: discord.TextChannel,
+    ) -> None:
+        """VC 単位の入退室通知を追加または更新する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+        if not _can_bot_send_voice_notify(notify, interaction):
+            await interaction.response.send_message(
+                "そのチャンネルに送信する権限が Bot にありません。",
+                ephemeral=True,
+            )
+            return
+
+        guild_id = str(interaction.guild_id)
+        async with async_session() as session:
+            await set_voice_notify_config(
+                session,
+                guild_id,
+                str(voice.id),
+                str(notify.id),
+            )
+
+        await interaction.response.send_message(
+            "\n".join(
+                [
+                    "VC入退室通知を設定しました。",
+                    f"監視VC: <#{voice.id}>",
+                    f"通知先: <#{notify.id}>",
+                ]
+            ),
+            ephemeral=True,
+        )
+
+    @voice_notify_group.command(
+        name="remove",
+        description="VC入退室通知を解除します",
+    )
+    async def voice_notify_remove(
+        self,
+        interaction: discord.Interaction,
+        voice: discord.VoiceChannel | discord.StageChannel,
+    ) -> None:
+        """VC 単位の入退室通知を削除する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            removed = await delete_voice_notify_config(
+                session,
+                str(interaction.guild_id),
+                str(voice.id),
+            )
+
+        content = (
+            f"VC入退室通知を解除しました。監視VC: <#{voice.id}>"
+            if removed
+            else f"そのVCの入退室通知は設定されていません。監視VC: <#{voice.id}>"
+        )
+        await interaction.response.send_message(content, ephemeral=True)
+
+    @voice_notify_group.command(
+        name="add-category",
+        description="カテゴリ内VCの入退室通知を追加または更新します",
+    )
+    async def voice_notify_add_category(
+        self,
+        interaction: discord.Interaction,
+        category: discord.CategoryChannel,
+        notify: discord.TextChannel,
+    ) -> None:
+        """カテゴリ単位の入退室通知を追加または更新する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+        if not _can_bot_send_voice_notify(notify, interaction):
+            await interaction.response.send_message(
+                "そのチャンネルに送信する権限が Bot にありません。",
+                ephemeral=True,
+            )
+            return
+
+        guild_id = str(interaction.guild_id)
+        async with async_session() as session:
+            await set_voice_notify_category_config(
+                session,
+                guild_id,
+                str(category.id),
+                str(notify.id),
+            )
+
+        await interaction.response.send_message(
+            "\n".join(
+                [
+                    "VCカテゴリ入退室通知を設定しました。",
+                    f"監視カテゴリ: <#{category.id}>",
+                    f"通知先: <#{notify.id}>",
+                ]
+            ),
+            ephemeral=True,
+        )
+
+    @voice_notify_group.command(
+        name="remove-category",
+        description="カテゴリ内VCの入退室通知を解除します",
+    )
+    async def voice_notify_remove_category(
+        self,
+        interaction: discord.Interaction,
+        category: discord.CategoryChannel,
+    ) -> None:
+        """カテゴリ単位の入退室通知を削除する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            removed = await delete_voice_notify_category_config(
+                session,
+                str(interaction.guild_id),
+                str(category.id),
+            )
+
+        content = (
+            f"VCカテゴリ入退室通知を解除しました。監視カテゴリ: <#{category.id}>"
+            if removed
+            else "そのカテゴリの入退室通知は設定されていません。"
+            f"監視カテゴリ: <#{category.id}>"
+        )
+        await interaction.response.send_message(content, ephemeral=True)
+
+    @voice_notify_group.command(
+        name="exclude-add",
+        description="カテゴリ通知から除外するVCを追加します",
+    )
+    async def voice_notify_exclude_add(
+        self,
+        interaction: discord.Interaction,
+        voice: discord.VoiceChannel | discord.StageChannel,
+    ) -> None:
+        """カテゴリ通知の除外 VC を追加する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        guild_id = str(interaction.guild_id)
+        async with async_session() as session:
+            await add_voice_notify_exclude(session, guild_id, str(voice.id))
+
+        await interaction.response.send_message(
+            f"カテゴリ通知の除外VCに追加しました。除外VC: <#{voice.id}>",
+            ephemeral=True,
+        )
+
+    @voice_notify_group.command(
+        name="exclude-remove",
+        description="カテゴリ通知の除外VCを解除します",
+    )
+    async def voice_notify_exclude_remove(
+        self,
+        interaction: discord.Interaction,
+        voice: discord.VoiceChannel | discord.StageChannel,
+    ) -> None:
+        """カテゴリ通知の除外 VC を削除する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            removed = await delete_voice_notify_exclude(
+                session,
+                str(interaction.guild_id),
+                str(voice.id),
+            )
+
+        content = (
+            f"カテゴリ通知の除外VCを解除しました。除外VC: <#{voice.id}>"
+            if removed
+            else "そのVCはカテゴリ通知の除外対象に設定されていません。"
+            f"除外VC: <#{voice.id}>"
+        )
+        await interaction.response.send_message(content, ephemeral=True)
+
+    @voice_notify_group.command(
+        name="status",
+        description="VC入退室通知の設定を表示します",
+    )
+    async def voice_notify_status(self, interaction: discord.Interaction) -> None:
+        """VC 入退室通知設定を表示する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            configs = await list_voice_notify_configs(
+                session,
+                str(interaction.guild_id),
+            )
+            category_configs = await list_voice_notify_category_configs(
+                session,
+                str(interaction.guild_id),
+            )
+            excludes = await list_voice_notify_excludes(
+                session,
+                str(interaction.guild_id),
+            )
+
+        if not configs and not category_configs and not excludes:
+            await interaction.response.send_message(
+                "VC入退室通知は設定されていません。",
+                ephemeral=True,
+            )
+            return
+
+        lines = ["VC入退室通知の設定:"]
+        fixed_lines = _format_limited_voice_notify_lines(
+            [
+                f"・<#{config.voice_channel_id}> -> <#{config.notify_channel_id}>"
+                for config in configs
+            ]
+        )
+        category_lines = _format_limited_voice_notify_lines(
+            [
+                f"・<#{config.category_id}> -> <#{config.notify_channel_id}>"
+                for config in category_configs
+            ]
+        )
+        exclude_lines = _format_limited_voice_notify_lines(
+            [f"・<#{exclude.voice_channel_id}>" for exclude in excludes]
+        )
+
+        if fixed_lines:
+            lines.extend(["固定VC:", *fixed_lines])
+        if category_lines:
+            lines.extend(["カテゴリ:", *category_lines])
+        if exclude_lines:
+            lines.extend(["カテゴリ通知の除外VC:", *exclude_lines])
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     async def cog_app_command_error(
         self,
