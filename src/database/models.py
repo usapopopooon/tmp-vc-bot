@@ -305,6 +305,55 @@ class VoiceNotifyExclude(Base):
         )
 
 
+class VoiceNotifyCrossGuildConfig(Base):
+    """サーバー間 VC 入退室通知の設定テーブル。"""
+
+    __tablename__ = "voice_notify_cross_guild_configs"
+    __table_args__ = (
+        UniqueConstraint(
+            "guild_id",
+            name="uq_voice_notify_cross_guild_guild",
+        ),
+        Index("ix_voice_notify_cross_guild_configs_guild_id", "guild_id"),
+        Index(
+            "ix_voice_notify_cross_guild_configs_notify_channel_id",
+            "notify_channel_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    guild_id: Mapped[str] = mapped_column(String, nullable=False)
+    share_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    notify_channel_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    invite_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    @validates("guild_id", "notify_channel_id")
+    def _validate_ids(self, key: str, value: str | None) -> str | None:
+        if key == "notify_channel_id" and value is None:
+            return value
+        if value is None:
+            msg = f"{key} must be a digit string, got: {value!r}"
+            raise ValueError(msg)
+        return _validate_discord_id(value, key)
+
+    def __repr__(self) -> str:
+        return (
+            f"<VoiceNotifyCrossGuildConfig(id={self.id}, guild_id={self.guild_id}, "
+            f"share_enabled={self.share_enabled}, "
+            f"notify_channel_id={self.notify_channel_id}, "
+            f"invite_url={self.invite_url})>"
+        )
+
+
 class ProcessedEvent(Base):
     """重複排除テーブル (マルチインスタンス重複防止)。
 

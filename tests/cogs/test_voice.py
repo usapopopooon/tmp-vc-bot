@@ -17,6 +17,7 @@ from src.cogs.voice import (
     _cleanup_vc_create_cooldown_cache,
     _vc_create_cooldown_cache,
     clear_vc_create_cooldown_cache,
+    create_cross_guild_voice_notify_message,
     create_voice_notify_message,
     is_vc_create_on_cooldown,
     record_vc_create_cooldown,
@@ -1539,6 +1540,7 @@ class TestVoiceNotify:
         after.channel = after_channel
 
         cog._send_voice_notification = AsyncMock()  # type: ignore[method-assign]
+        cog._send_cross_guild_voice_notification = AsyncMock()  # type: ignore[method-assign]
 
         await cog._handle_voice_notify_state_update(member, before, after)
 
@@ -1553,6 +1555,174 @@ class TestVoiceNotify:
             member,
             after_channel,
             "join",
+        )
+        assert cog._send_cross_guild_voice_notification.await_args_list[0].args == (
+            member.guild,
+            member,
+            before_channel,
+            "leave",
+        )
+        assert cog._send_cross_guild_voice_notification.await_args_list[1].args == (
+            member.guild,
+            member,
+            after_channel,
+            "join",
+        )
+
+    async def test_cross_guild_voice_notify_error_does_not_block_local_notify(
+        self,
+    ) -> None:
+        """サーバー間通知の失敗は通常通知の処理を止めない。"""
+        cog = _make_cog()
+        member = _make_member(1)
+        member.guild = MagicMock(spec=discord.Guild)
+        member.guild.id = 1000
+
+        before_channel = _make_channel(100)
+        after_channel = _make_channel(200)
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = before_channel
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = after_channel
+
+        cog._send_voice_notification = AsyncMock()  # type: ignore[method-assign]
+        cog._send_cross_guild_voice_notification = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[RuntimeError("cross failed"), False]
+        )
+
+        await cog._handle_voice_notify_state_update(member, before, after)
+
+        assert cog._send_voice_notification.await_count == 2
+        assert cog._send_voice_notification.await_args_list[0].args == (
+            member.guild,
+            member,
+            before_channel,
+            "leave",
+        )
+        assert cog._send_voice_notification.await_args_list[1].args == (
+            member.guild,
+            member,
+            after_channel,
+            "join",
+        )
+        assert cog._send_cross_guild_voice_notification.await_count == 2
+
+    def test_create_cross_guild_voice_notify_message_escapes_names(self) -> None:
+        """サーバー間通知本文ではサーバー名・部屋名・表示名をエスケープする。"""
+        guild = MagicMock(spec=discord.Guild)
+        guild.name = "*作業鯖*"
+        voice_channel = _make_channel(100)
+        voice_channel.name = "_集中部屋_"
+        member = _make_member(1)
+        member.display_name = "*ほげ*"
+
+        message = create_cross_guild_voice_notify_message(
+            guild,
+            member,
+            voice_channel,
+            "join",
+            invite_url="https://discord.gg/test",
+        )
+
+        assert message == (
+            r"\*ほげ\* さんが [\*作業鯖\*](https://discord.gg/test) の "
+            r"\_集中部屋\_ に入室しました。"
+        )
+
+    async def test_send_cross_guild_voice_notification_requires_share_enabled(
+        self,
+    ) -> None:
+        """発信元サーバーの共有が OFF ならサーバー間通知しない。"""
+        cog = _make_cog()
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 1000
+        voice_channel = _make_channel(100)
+        member = _make_member(1)
+        source_config = MagicMock()
+        source_config.share_enabled = False
+        mock_factory, mock_session = _mock_async_session()
+
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_voice_notify_cross_guild_config",
+                new_callable=AsyncMock,
+                return_value=source_config,
+            ) as mock_get_source,
+            patch(
+                "src.cogs.voice.list_voice_notify_cross_guild_receivers",
+                new_callable=AsyncMock,
+            ) as mock_list_receivers,
+        ):
+            sent = await cog._send_cross_guild_voice_notification(
+                guild,
+                member,
+                voice_channel,
+                "join",
+            )
+
+        assert sent is False
+        mock_get_source.assert_awaited_once_with(mock_session, "1000")
+        mock_list_receivers.assert_not_awaited()
+
+    async def test_send_cross_guild_voice_notification_sends_to_receivers(
+        self,
+    ) -> None:
+        """共有 ON の発信元から、受信先設定済みサーバーへ通知する。"""
+        cog = _make_cog()
+        source_guild = MagicMock(spec=discord.Guild)
+        source_guild.id = 1000
+        source_guild.name = "作業鯖"
+        voice_channel = _make_channel(100)
+        voice_channel.name = "集中部屋"
+        member = _make_member(1)
+        member.display_name = "ほげ"
+
+        source_config = MagicMock()
+        source_config.share_enabled = True
+        source_config.invite_url = "https://discord.gg/test"
+        receiver_config = MagicMock()
+        receiver_config.guild_id = "2000"
+        receiver_config.notify_channel_id = "300"
+        notify_channel = MagicMock(spec=discord.TextChannel)
+        notify_channel.send = AsyncMock()
+        mock_factory, mock_session = _mock_async_session()
+
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_voice_notify_cross_guild_config",
+                new_callable=AsyncMock,
+                return_value=source_config,
+            ),
+            patch(
+                "src.cogs.voice.list_voice_notify_cross_guild_receivers",
+                new_callable=AsyncMock,
+                return_value=[receiver_config],
+            ) as mock_list_receivers,
+        ):
+            cog._fetch_cross_guild_voice_notify_channel = AsyncMock(  # type: ignore[method-assign]
+                return_value=notify_channel
+            )
+            sent = await cog._send_cross_guild_voice_notification(
+                source_guild,
+                member,
+                voice_channel,
+                "join",
+            )
+
+        assert sent is True
+        mock_list_receivers.assert_awaited_once_with(
+            mock_session,
+            exclude_guild_id="1000",
+        )
+        cog._fetch_cross_guild_voice_notify_channel.assert_awaited_once_with(
+            "2000",
+            "300",
+        )
+        notify_channel.send.assert_awaited_once()
+        assert notify_channel.send.call_args.args[0] == (
+            "ほげ さんが [作業鯖](https://discord.gg/test) の 集中部屋 に入室しました。"
         )
 
     async def test_send_voice_notification_deduplicates_direct_and_category(

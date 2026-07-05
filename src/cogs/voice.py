@@ -20,6 +20,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Literal, TypeGuard
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -69,6 +70,7 @@ from src.services.db_service import (
     get_lobbies_by_guild,
     get_lobby_by_channel_id,
     get_voice_notify_category_config,
+    get_voice_notify_cross_guild_config,
     get_voice_session,
     get_voice_session_members_ordered,
     get_voice_sessions_by_lobby,
@@ -76,10 +78,14 @@ from src.services.db_service import (
     list_voice_notify_category_configs,
     list_voice_notify_configs,
     list_voice_notify_configs_by_voice_channel,
+    list_voice_notify_cross_guild_receivers,
     list_voice_notify_excludes,
     remove_voice_session_member,
     set_voice_notify_category_config,
     set_voice_notify_config,
+    set_voice_notify_cross_guild_channel,
+    set_voice_notify_cross_guild_invite_url,
+    set_voice_notify_cross_guild_share,
     update_voice_session,
 )
 from src.ui.control_panel import (
@@ -411,6 +417,52 @@ def create_voice_notify_message(
     return f"{display_name} さんが <#{voice_channel_id}> から退室しました。"
 
 
+def _escape_voice_notify_text(value: str) -> str:
+    """通知本文に埋め込むプレーンテキストをエスケープする。"""
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(value))
+
+
+def _voice_notify_invite_link(label: str, invite_url: str | None) -> str:
+    """招待 URL があればラベルを Discord のマスクリンクにする。"""
+    escaped_label = (
+        _escape_voice_notify_text(label).replace("[", r"\[").replace("]", r"\]")
+    )
+    if invite_url is None:
+        return escaped_label
+    return f"[{escaped_label}]({invite_url})"
+
+
+def _is_discord_invite_url(value: str) -> bool:
+    """Discord の招待 URL として扱ってよいかを判定する。"""
+    parsed = urlparse(value)
+    if parsed.scheme != "https":
+        return False
+
+    host = parsed.netloc.lower()
+    if host == "discord.gg":
+        return bool(parsed.path.strip("/"))
+    if host in {"discord.com", "www.discord.com", "discordapp.com"}:
+        path_parts = [part for part in parsed.path.split("/") if part]
+        return len(path_parts) >= 2 and path_parts[0] == "invite"
+    return False
+
+
+def create_cross_guild_voice_notify_message(
+    guild: discord.Guild,
+    member: discord.Member,
+    voice_channel: discord.VoiceChannel | discord.StageChannel,
+    event_type: VoiceNotifyEventType,
+    invite_url: str | None = None,
+) -> str:
+    """サーバー間 VC 入退室通知の本文を作成する。"""
+    guild_name = _voice_notify_invite_link(guild.name, invite_url)
+    channel_name = _escape_voice_notify_text(voice_channel.name)
+    display_name = _escape_voice_notify_text(member.display_name)
+    if event_type == "join":
+        return f"{display_name} さんが {guild_name} の {channel_name} に入室しました。"
+    return f"{display_name} さんが {guild_name} の {channel_name} から退室しました。"
+
+
 def _is_voice_notify_voice_channel(
     channel: object,
 ) -> TypeGuard[discord.VoiceChannel | discord.StageChannel]:
@@ -643,6 +695,18 @@ class VoiceCog(commands.Cog):
                 before_channel,
                 "leave",
             )
+            try:
+                await self._send_cross_guild_voice_notification(
+                    guild,
+                    member,
+                    before_channel,
+                    "leave",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to handle cross-guild voice notification: member=%s",
+                    member.id,
+                )
 
         if after_channel is not None:
             await self._send_voice_notification(
@@ -651,6 +715,18 @@ class VoiceCog(commands.Cog):
                 after_channel,
                 "join",
             )
+            try:
+                await self._send_cross_guild_voice_notification(
+                    guild,
+                    member,
+                    after_channel,
+                    "join",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to handle cross-guild voice notification: member=%s",
+                    member.id,
+                )
 
     async def _send_voice_notification(
         self,
@@ -754,6 +830,115 @@ class VoiceCog(commands.Cog):
             return None
 
         if _is_voice_notify_sendable_channel(fetched):
+            return fetched
+        return None
+
+    async def _send_cross_guild_voice_notification(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        voice_channel: discord.VoiceChannel | discord.StageChannel,
+        event_type: VoiceNotifyEventType,
+    ) -> bool:
+        """共有 ON のサーバーの VC 入退室を、受信設定済みサーバーへ通知する。"""
+        guild_id = str(guild.id)
+
+        async with async_session() as session:
+            source_config = await get_voice_notify_cross_guild_config(
+                session,
+                guild_id,
+            )
+            if source_config is None or not source_config.share_enabled:
+                return False
+
+            receiver_configs = await list_voice_notify_cross_guild_receivers(
+                session,
+                exclude_guild_id=guild_id,
+            )
+
+        if not receiver_configs:
+            return False
+
+        invite_url = (
+            source_config.invite_url
+            if isinstance(source_config.invite_url, str) and source_config.invite_url
+            else None
+        )
+        content = create_cross_guild_voice_notify_message(
+            guild,
+            member,
+            voice_channel,
+            event_type,
+            invite_url=invite_url,
+        )
+        sent = False
+        for config in receiver_configs:
+            if config.notify_channel_id is None:
+                continue
+            channel = await self._fetch_cross_guild_voice_notify_channel(
+                config.guild_id,
+                config.notify_channel_id,
+            )
+            if channel is None:
+                logger.warning(
+                    "Cross-guild voice notify channel is not sendable: "
+                    "source_guild=%s receiver_guild=%s notify=%s",
+                    guild_id,
+                    config.guild_id,
+                    config.notify_channel_id,
+                )
+                continue
+
+            try:
+                await channel.send(
+                    content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                sent = True
+            except discord.HTTPException as e:
+                logger.warning(
+                    "Failed to send cross-guild voice notification: "
+                    "source_guild=%s receiver_guild=%s notify=%s error=%s",
+                    guild_id,
+                    config.guild_id,
+                    config.notify_channel_id,
+                    e,
+                )
+
+        return sent
+
+    async def _fetch_cross_guild_voice_notify_channel(
+        self,
+        guild_id: str,
+        channel_id: str,
+    ) -> discord.TextChannel | None:
+        """サーバー間通知の送信先テキストチャンネルを取得する。"""
+        try:
+            guild_id_int = int(guild_id)
+            channel_id_int = int(channel_id)
+        except ValueError:
+            return None
+
+        guild = self.bot.get_guild(guild_id_int)
+        if guild is not None:
+            return await self._fetch_voice_notify_sendable_channel(guild, channel_id)
+
+        channel = self.bot.get_channel(channel_id_int)
+        if (
+            _is_voice_notify_sendable_channel(channel)
+            and channel.guild.id == guild_id_int
+        ):
+            return channel
+
+        try:
+            fetched = await self.bot.fetch_channel(channel_id_int)
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            return None
+
+        if (
+            _is_voice_notify_sendable_channel(fetched)
+            and fetched.guild.id == guild_id_int
+        ):
             return fetched
         return None
 
@@ -1767,6 +1952,12 @@ class VoiceCog(commands.Cog):
         default_permissions=discord.Permissions(administrator=True),
         guild_only=True,
     )
+    voice_notify_cross_group = app_commands.Group(
+        name="voice-notify-cross",
+        description="サーバー間VC入退室通知を管理します",
+        default_permissions=discord.Permissions(administrator=True),
+        guild_only=True,
+    )
 
     @vc_group.command(name="lobby", description="ロビーVCを作成します")
     @app_commands.describe(dialog="連番共有ロビーをダイアログで設定します")
@@ -2169,6 +2360,204 @@ class VoiceCog(commands.Cog):
             lines.extend(["カテゴリ通知の除外VC:", *exclude_lines])
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @voice_notify_cross_group.command(
+        name="share",
+        description="このサーバーのVC入退室を他サーバーへ共有するか設定します",
+    )
+    async def voice_notify_cross_share(
+        self,
+        interaction: discord.Interaction,
+        enabled: bool,
+    ) -> None:
+        """このサーバーの VC 入退室をサーバー間通知へ共有するか設定する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            await set_voice_notify_cross_guild_share(
+                session,
+                str(interaction.guild_id),
+                enabled,
+            )
+
+        status = "ON" if enabled else "OFF"
+        await interaction.response.send_message(
+            f"サーバー間VC入退室共有を {status} にしました。",
+            ephemeral=True,
+        )
+
+    @voice_notify_cross_group.command(
+        name="receive",
+        description="他サーバーから共有されたVC入退室通知の受信先を設定します",
+    )
+    async def voice_notify_cross_receive(
+        self,
+        interaction: discord.Interaction,
+        notify: discord.TextChannel,
+    ) -> None:
+        """他サーバーから共有された VC 入退室通知の受信先を設定する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+        if not _can_bot_send_voice_notify(notify, interaction):
+            await interaction.response.send_message(
+                "そのチャンネルに送信する権限が Bot にありません。",
+                ephemeral=True,
+            )
+            return
+
+        async with async_session() as session:
+            await set_voice_notify_cross_guild_channel(
+                session,
+                str(interaction.guild_id),
+                str(notify.id),
+            )
+
+        await interaction.response.send_message(
+            f"サーバー間VC入退室通知の受信先を設定しました。通知先: <#{notify.id}>",
+            ephemeral=True,
+        )
+
+    @voice_notify_cross_group.command(
+        name="invite",
+        description="サーバー間通知のサーバー名リンクに使う招待URLを設定します",
+    )
+    async def voice_notify_cross_invite(
+        self,
+        interaction: discord.Interaction,
+        url: str,
+    ) -> None:
+        """サーバー間 VC 入退室通知で使う固定招待 URL を設定する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        invite_url = url.strip()
+        if not _is_discord_invite_url(invite_url):
+            await interaction.response.send_message(
+                "Discord の招待URLを指定してください。",
+                ephemeral=True,
+            )
+            return
+
+        async with async_session() as session:
+            await set_voice_notify_cross_guild_invite_url(
+                session,
+                str(interaction.guild_id),
+                invite_url,
+            )
+
+        await interaction.response.send_message(
+            "サーバー間VC入退室通知の招待URLを設定しました。",
+            ephemeral=True,
+        )
+
+    @voice_notify_cross_group.command(
+        name="invite-remove",
+        description="サーバー間通知の招待URLを解除します",
+    )
+    async def voice_notify_cross_invite_remove(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        """サーバー間 VC 入退室通知で使う固定招待 URL を解除する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            config = await get_voice_notify_cross_guild_config(
+                session,
+                str(interaction.guild_id),
+            )
+            removed = config is not None and config.invite_url is not None
+            if removed:
+                await set_voice_notify_cross_guild_invite_url(
+                    session,
+                    str(interaction.guild_id),
+                    None,
+                )
+
+        content = (
+            "サーバー間VC入退室通知の招待URLを解除しました。"
+            if removed
+            else "サーバー間VC入退室通知の招待URLは設定されていません。"
+        )
+        await interaction.response.send_message(content, ephemeral=True)
+
+    @voice_notify_cross_group.command(
+        name="receive-remove",
+        description="サーバー間VC入退室通知の受信先を解除します",
+    )
+    async def voice_notify_cross_receive_remove(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        """サーバー間 VC 入退室通知の受信先を解除する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            config = await get_voice_notify_cross_guild_config(
+                session,
+                str(interaction.guild_id),
+            )
+            removed = config is not None and config.notify_channel_id is not None
+            if removed:
+                await set_voice_notify_cross_guild_channel(
+                    session,
+                    str(interaction.guild_id),
+                    None,
+                )
+
+        content = (
+            "サーバー間VC入退室通知の受信先を解除しました。"
+            if removed
+            else "サーバー間VC入退室通知の受信先は設定されていません。"
+        )
+        await interaction.response.send_message(content, ephemeral=True)
+
+    @voice_notify_cross_group.command(
+        name="status",
+        description="サーバー間VC入退室通知の設定を表示します",
+    )
+    async def voice_notify_cross_status(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        """サーバー間 VC 入退室通知設定を表示する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            config = await get_voice_notify_cross_guild_config(
+                session,
+                str(interaction.guild_id),
+            )
+
+        if config is None:
+            await interaction.response.send_message(
+                "サーバー間VC入退室通知は設定されていません。",
+                ephemeral=True,
+            )
+            return
+
+        share_status = "ON" if config.share_enabled else "OFF"
+        receive_status = (
+            f"<#{config.notify_channel_id}>"
+            if config.notify_channel_id is not None
+            else "未設定"
+        )
+        invite_status = "設定済み" if config.invite_url is not None else "未設定"
+        await interaction.response.send_message(
+            "\n".join(
+                [
+                    "サーバー間VC入退室通知の設定:",
+                    f"共有: {share_status}",
+                    f"受信先: {receive_status}",
+                    f"招待URL: {invite_status}",
+                ]
+            ),
+            ephemeral=True,
+        )
 
     async def cog_app_command_error(
         self,

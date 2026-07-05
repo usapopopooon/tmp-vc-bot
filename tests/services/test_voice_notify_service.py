@@ -20,16 +20,22 @@ from src.services.db_service import (
     delete_voice_notify_by_guild,
     delete_voice_notify_category_config,
     delete_voice_notify_config,
+    delete_voice_notify_cross_guild_config,
     delete_voice_notify_exclude,
     get_voice_notify_category_config,
     get_voice_notify_config,
+    get_voice_notify_cross_guild_config,
     is_voice_notify_excluded,
     list_voice_notify_category_configs,
     list_voice_notify_configs,
     list_voice_notify_configs_by_voice_channel,
+    list_voice_notify_cross_guild_receivers,
     list_voice_notify_excludes,
     set_voice_notify_category_config,
     set_voice_notify_config,
+    set_voice_notify_cross_guild_channel,
+    set_voice_notify_cross_guild_invite_url,
+    set_voice_notify_cross_guild_share,
 )
 
 if TYPE_CHECKING:
@@ -173,6 +179,97 @@ class TestVoiceNotifyExcludeOperations:
         assert await is_voice_notify_excluded(db_session, "123", "456") is False
 
 
+class TestVoiceNotifyCrossGuildOperations:
+    """サーバー間通知設定の操作テスト。"""
+
+    async def test_set_share_and_receive_channel(
+        self,
+        db_session: AsyncSession,
+    ) -> None:
+        """共有フラグと受信先を別々に設定できる。"""
+        shared = await set_voice_notify_cross_guild_share(
+            db_session,
+            "123",
+            True,
+        )
+
+        assert shared.guild_id == "123"
+        assert shared.share_enabled is True
+        assert shared.notify_channel_id is None
+
+        received = await set_voice_notify_cross_guild_channel(
+            db_session,
+            "123",
+            "789",
+        )
+
+        assert received.id == shared.id
+        assert received.share_enabled is True
+        assert received.notify_channel_id == "789"
+
+        found = await get_voice_notify_cross_guild_config(db_session, "123")
+        assert found is not None
+        assert found.share_enabled is True
+        assert found.notify_channel_id == "789"
+
+    async def test_set_and_clear_invite_url(
+        self,
+        db_session: AsyncSession,
+    ) -> None:
+        """サーバー間通知用の固定招待 URL を設定・解除できる。"""
+        configured = await set_voice_notify_cross_guild_invite_url(
+            db_session,
+            "123",
+            "https://discord.gg/example",
+        )
+
+        assert configured.invite_url == "https://discord.gg/example"
+
+        cleared = await set_voice_notify_cross_guild_invite_url(
+            db_session,
+            "123",
+            None,
+        )
+
+        assert cleared.invite_url is None
+
+    async def test_list_receivers_excludes_source_guild(
+        self,
+        db_session: AsyncSession,
+    ) -> None:
+        """受信先一覧は通知先ありだけを返し、発信元を除外できる。"""
+        await set_voice_notify_cross_guild_channel(db_session, "123", "789")
+        await set_voice_notify_cross_guild_channel(db_session, "234", "890")
+        await set_voice_notify_cross_guild_share(db_session, "345", True)
+
+        receivers = await list_voice_notify_cross_guild_receivers(
+            db_session,
+            exclude_guild_id="123",
+        )
+
+        assert [config.guild_id for config in receivers] == ["234"]
+
+    async def test_clear_channel_and_delete_config(
+        self,
+        db_session: AsyncSession,
+    ) -> None:
+        """受信先解除と設定削除ができる。"""
+        await set_voice_notify_cross_guild_share(db_session, "123", True)
+        await set_voice_notify_cross_guild_channel(db_session, "123", "789")
+
+        cleared = await set_voice_notify_cross_guild_channel(
+            db_session,
+            "123",
+            None,
+        )
+        assert cleared.share_enabled is True
+        assert cleared.notify_channel_id is None
+
+        assert await delete_voice_notify_cross_guild_config(db_session, "123") is True
+        assert await delete_voice_notify_cross_guild_config(db_session, "123") is False
+        assert await get_voice_notify_cross_guild_config(db_session, "123") is None
+
+
 class TestVoiceNotifyCleanupOperations:
     """通知設定の一括クリーンアップテスト。"""
 
@@ -185,14 +282,20 @@ class TestVoiceNotifyCleanupOperations:
         await set_voice_notify_config(db_session, "123", "111", "456")
         await set_voice_notify_category_config(db_session, "123", "222", "456")
         await add_voice_notify_exclude(db_session, "123", "456")
+        await set_voice_notify_cross_guild_share(db_session, "123", True)
+        await set_voice_notify_cross_guild_channel(db_session, "123", "456")
         await set_voice_notify_config(db_session, "999", "456", "999")
 
         deleted = await delete_voice_notify_by_channel(db_session, "123", "456")
 
-        assert deleted == 4
+        assert deleted == 5
         assert await list_voice_notify_configs(db_session, "123") == []
         assert await list_voice_notify_category_configs(db_session, "123") == []
         assert await list_voice_notify_excludes(db_session, "123") == []
+        cross_config = await get_voice_notify_cross_guild_config(db_session, "123")
+        assert cross_config is not None
+        assert cross_config.share_enabled is True
+        assert cross_config.notify_channel_id is None
         assert len(await list_voice_notify_configs(db_session, "999")) == 1
 
     async def test_delete_by_guild(
@@ -202,11 +305,13 @@ class TestVoiceNotifyCleanupOperations:
         """サーバー単位で通知設定を削除できる。"""
         await set_voice_notify_config(db_session, "123", "456", "999")
         await set_voice_notify_category_config(db_session, "234", "222", "999")
+        await set_voice_notify_cross_guild_channel(db_session, "234", "999")
         await add_voice_notify_exclude(db_session, "345", "777")
 
         deleted = await delete_voice_notify_by_guild(db_session, "234")
 
-        assert deleted == 1
+        assert deleted == 2
         assert await list_voice_notify_category_configs(db_session, "234") == []
+        assert await get_voice_notify_cross_guild_config(db_session, "234") is None
         assert len(await list_voice_notify_configs(db_session, "123")) == 1
         assert len(await list_voice_notify_excludes(db_session, "345")) == 1
