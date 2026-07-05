@@ -19,6 +19,7 @@ from src.cogs.voice import (
     clear_vc_create_cooldown_cache,
     create_cross_guild_voice_notify_embed,
     create_cross_guild_voice_notify_message,
+    create_voice_notify_embed,
     create_voice_notify_message,
     is_vc_create_on_cooldown,
     record_vc_create_cooldown,
@@ -1530,6 +1531,17 @@ class TestVoiceNotify:
 
         assert message == r"\*ほげ\* さんが <#100> に入室しました。"
 
+    def test_create_voice_notify_embed_uses_description(self) -> None:
+        """通常通知 Embed は本文に通知メッセージを入れる。"""
+        member = _make_member(1)
+        member.display_name = "ほげ"
+
+        embed = create_voice_notify_embed(member, "100", "join")
+
+        assert embed.title is None
+        assert embed.description == "ほげ さんが <#100> に入室しました。"
+        assert embed.url is None
+
     async def test_handle_voice_notify_sends_leave_then_join(self) -> None:
         """VC 移動時は退出通知のあとに入室通知を処理する。"""
         cog = _make_cog()
@@ -1947,7 +1959,9 @@ class TestVoiceNotify:
         mock_list.assert_awaited_once_with(mock_session, "1000", "100")
         mock_is_excluded.assert_awaited_once_with(mock_session, "1000", "100")
         notify_channel.send.assert_awaited_once()
-        assert notify_channel.send.call_args.args[0] == (
+        assert notify_channel.send.call_args.args == ()
+        assert notify_channel.send.call_args.kwargs["embed"].title is None
+        assert notify_channel.send.call_args.kwargs["embed"].description == (
             "ほげほげ さんが <#100> に入室しました。"
         )
 

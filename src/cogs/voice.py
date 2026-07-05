@@ -439,6 +439,21 @@ def create_voice_notify_message(
     return f"{display_name} さんが <#{voice_channel_id}> から退室しました。"
 
 
+def create_voice_notify_embed(
+    member: discord.Member,
+    voice_channel_id: int | str,
+    event_type: VoiceNotifyEventType,
+) -> discord.Embed:
+    """VC 入退室通知の Embed を作成する。"""
+    return discord.Embed(
+        description=create_voice_notify_message(
+            member,
+            voice_channel_id,
+            event_type,
+        )
+    )
+
+
 def _escape_voice_notify_text(value: str) -> str:
     """通知本文に埋め込むプレーンテキストをエスケープする。"""
     return discord.utils.escape_markdown(discord.utils.escape_mentions(value))
@@ -938,7 +953,7 @@ class VoiceCog(commands.Cog):
         if not notify_channel_ids:
             return False
 
-        content = create_voice_notify_message(member, voice_channel_id, event_type)
+        embed = create_voice_notify_embed(member, voice_channel_id, event_type)
         sent = False
         for notify_channel_id in notify_channel_ids:
             channel = await self._fetch_voice_notify_sendable_channel(
@@ -956,7 +971,7 @@ class VoiceCog(commands.Cog):
 
             try:
                 await channel.send(
-                    content,
+                    embed=embed,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 sent = True
