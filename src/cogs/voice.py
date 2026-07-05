@@ -440,12 +440,10 @@ def _escape_voice_notify_text(value: str) -> str:
     return discord.utils.escape_markdown(discord.utils.escape_mentions(value))
 
 
-def _voice_notify_invite_link(label: str, invite_url: str | None) -> str:
-    """招待 URL があればクリック可能な裸 URL として添える。"""
+def _voice_notify_guild_label(label: str, _invite_url: str | None) -> str:
+    """サーバー間通知本文に表示するサーバー名を返す。"""
     escaped_label = _escape_voice_notify_text(label)
-    if invite_url is None:
-        return escaped_label
-    return f"{escaped_label} {invite_url}"
+    return escaped_label
 
 
 def _is_discord_invite_url(value: str) -> bool:
@@ -471,12 +469,33 @@ def create_cross_guild_voice_notify_message(
     invite_url: str | None = None,
 ) -> str:
     """サーバー間 VC 入退室通知の本文を作成する。"""
-    guild_name = _voice_notify_invite_link(guild.name, invite_url)
+    guild_name = _voice_notify_guild_label(guild.name, invite_url)
     channel_name = _escape_voice_notify_text(voice_channel.name)
     display_name = _escape_voice_notify_text(member.display_name)
     if event_type == "join":
         return f"{display_name} さんが {guild_name} の {channel_name} に入室しました。"
     return f"{display_name} さんが {guild_name} の {channel_name} から退室しました。"
+
+
+def create_cross_guild_voice_notify_embed(
+    guild: discord.Guild,
+    voice_channel: discord.VoiceChannel | discord.StageChannel,
+    event_type: VoiceNotifyEventType,
+    invite_url: str | None = None,
+) -> discord.Embed | None:
+    """サーバー間 VC 入退室通知に添える招待リンク用 Embed を作成する。"""
+    if invite_url is None:
+        return None
+
+    color = discord.Color.green() if event_type == "join" else discord.Color.orange()
+    embed = discord.Embed(
+        title=_escape_voice_notify_text(guild.name),
+        url=invite_url,
+        description=f"部屋: {_escape_voice_notify_text(voice_channel.name)}",
+        color=color,
+    )
+    embed.set_footer(text="サーバー名を押すと招待リンクを開きます")
+    return embed
 
 
 def _is_voice_notify_voice_channel(
@@ -1011,6 +1030,12 @@ class VoiceCog(commands.Cog):
             event_type,
             invite_url=invite_url,
         )
+        embed = create_cross_guild_voice_notify_embed(
+            guild,
+            voice_channel,
+            event_type,
+            invite_url=invite_url,
+        )
         sent = False
         for config in receiver_configs:
             if config.notify_channel_id is None:
@@ -1024,6 +1049,7 @@ class VoiceCog(commands.Cog):
                     config.guild_id,
                     config.notify_channel_id,
                     content,
+                    embed,
                 ):
                     sent = True
                     continue
@@ -1042,16 +1068,24 @@ class VoiceCog(commands.Cog):
                 continue
 
             try:
-                await channel.send(
-                    content,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+                if embed is None:
+                    await channel.send(
+                        content,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    await channel.send(
+                        content,
+                        embed=embed,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                 sent = True
             except discord.HTTPException as e:
                 if await self._send_cross_guild_voice_notification_via_rest(
                     config.guild_id,
                     config.notify_channel_id,
                     content,
+                    embed,
                 ):
                     sent = True
                     continue
@@ -1072,6 +1106,7 @@ class VoiceCog(commands.Cog):
         guild_id: str,
         channel_id: str,
         content: str,
+        embed: discord.Embed | None = None,
     ) -> bool:
         """Bot クライアントのキャッシュ経由で送れない場合に REST で送信する。"""
         from src.config import settings
@@ -1122,14 +1157,17 @@ class VoiceCog(commands.Cog):
                     continue
 
                 message_url = f"{channel_url}/messages"
+                payload: dict[str, Any] = {
+                    "content": content,
+                    "allowed_mentions": {"parse": []},
+                }
+                if embed is not None:
+                    payload["embeds"] = [embed.to_dict()]
                 try:
                     async with http.post(
                         message_url,
                         headers=headers,
-                        json={
-                            "content": content,
-                            "allowed_mentions": {"parse": []},
-                        },
+                        json=payload,
                     ) as response:
                         if 200 <= response.status < 300:
                             return True

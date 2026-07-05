@@ -17,6 +17,7 @@ from src.cogs.voice import (
     _cleanup_vc_create_cooldown_cache,
     _vc_create_cooldown_cache,
     clear_vc_create_cooldown_cache,
+    create_cross_guild_voice_notify_embed,
     create_cross_guild_voice_notify_message,
     create_voice_notify_message,
     is_vc_create_on_cooldown,
@@ -1629,9 +1630,28 @@ class TestVoiceNotify:
         )
 
         assert message == (
-            r"\*ほげ\* さんが \*作業鯖\* https://discord.gg/test の "
+            r"\*ほげ\* さんが \*作業鯖\* の "
             r"\_集中部屋\_ に入室しました。"
         )
+
+    def test_create_cross_guild_voice_notify_embed_links_invite_url(self) -> None:
+        """サーバー間通知 Embed のタイトルは招待 URL にリンクする。"""
+        guild = MagicMock(spec=discord.Guild)
+        guild.name = "作業鯖"
+        voice_channel = _make_channel(100)
+        voice_channel.name = "集中部屋"
+
+        embed = create_cross_guild_voice_notify_embed(
+            guild,
+            voice_channel,
+            "join",
+            invite_url="https://discord.gg/test",
+        )
+
+        assert embed is not None
+        assert embed.title == "作業鯖"
+        assert embed.url == "https://discord.gg/test"
+        assert embed.description == "部屋: 集中部屋"
 
     async def test_send_cross_guild_voice_notification_requires_share_enabled(
         self,
@@ -1726,8 +1746,11 @@ class TestVoiceNotify:
         )
         notify_channel.send.assert_awaited_once()
         assert notify_channel.send.call_args.args[0] == (
-            "ほげ さんが 作業鯖 https://discord.gg/test の 集中部屋 に入室しました。"
+            "ほげ さんが 作業鯖 の 集中部屋 に入室しました。"
         )
+        embed = notify_channel.send.call_args.kwargs["embed"]
+        assert embed.title == "作業鯖"
+        assert embed.url == "https://discord.gg/test"
 
     async def test_send_cross_guild_voice_notification_uses_rest_fallback(
         self,
@@ -1744,7 +1767,7 @@ class TestVoiceNotify:
 
         source_config = MagicMock()
         source_config.share_enabled = True
-        source_config.invite_url = None
+        source_config.invite_url = "https://discord.gg/test"
         receiver_config = MagicMock()
         receiver_config.guild_id = "2000"
         receiver_config.notify_channel_id = "300"
@@ -1777,11 +1800,16 @@ class TestVoiceNotify:
             )
 
         assert sent is True
-        cog._send_cross_guild_voice_notification_via_rest.assert_awaited_once_with(
+        cog._send_cross_guild_voice_notification_via_rest.assert_awaited_once()
+        rest_args = cog._send_cross_guild_voice_notification_via_rest.await_args.args
+        assert rest_args[:3] == (
             "2000",
             "300",
             "ほげ さんが 作業鯖 の 集中部屋 に入室しました。",
         )
+        embed = rest_args[3]
+        assert embed.title == "作業鯖"
+        assert embed.url == "https://discord.gg/test"
 
     async def test_fetch_cross_guild_voice_notify_channel_uses_registered_bot(
         self,
