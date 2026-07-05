@@ -146,6 +146,9 @@ _FEATURE_OVERRIDE_FIELDS = (
 )
 
 VOICE_NOTIFY_STATUS_LIST_LIMIT = 20
+VOICE_NOTIFY_PERMISSION_ERROR_MESSAGE = (
+    "そのチャンネルに送信または埋め込みリンク送信する権限が Bot にありません。"
+)
 
 VoiceNotifyEventType = Literal["join", "leave"]
 
@@ -561,14 +564,31 @@ def _can_bot_send_voice_notify(
     if guild is None:
         return False
 
+    bot_user_id = (
+        interaction.client.user.id if interaction.client.user is not None else None
+    )
+    return _can_bot_send_voice_notify_in_guild(channel, guild, bot_user_id=bot_user_id)
+
+
+def _can_bot_send_voice_notify_in_guild(
+    channel: discord.TextChannel,
+    guild: discord.Guild,
+    *,
+    bot_user_id: int | None = None,
+) -> bool:
+    """指定チャンネルへ Bot が Embed 通知を送れるかを確認する。"""
     bot_member = guild.me
-    if bot_member is None and interaction.client.user is not None:
-        bot_member = guild.get_member(interaction.client.user.id)
+    if bot_member is None and bot_user_id is not None:
+        bot_member = guild.get_member(bot_user_id)
     if bot_member is None:
         return True
 
     permissions = channel.permissions_for(bot_member)
-    return permissions.view_channel and permissions.send_messages
+    return (
+        permissions.view_channel
+        and permissions.send_messages
+        and permissions.embed_links
+    )
 
 
 class VoiceCog(commands.Cog):
@@ -690,7 +710,8 @@ class VoiceCog(commands.Cog):
                     permissions = channel.permissions_for(bot_member)
                     permission_status = (
                         f"view={permissions.view_channel} "
-                        f"send={permissions.send_messages}"
+                        f"send={permissions.send_messages} "
+                        f"embed={permissions.embed_links}"
                     )
 
             details.append(
@@ -1000,14 +1021,18 @@ class VoiceCog(commands.Cog):
 
         channel = guild.get_channel(channel_id_int)
         if _is_voice_notify_sendable_channel(channel):
-            return channel
+            if _can_bot_send_voice_notify_in_guild(channel, guild):
+                return channel
+            return None
 
         try:
             fetched = await guild.fetch_channel(channel_id_int)
         except (discord.Forbidden, discord.HTTPException, discord.NotFound):
             return None
 
-        if _is_voice_notify_sendable_channel(fetched):
+        if _is_voice_notify_sendable_channel(
+            fetched
+        ) and _can_bot_send_voice_notify_in_guild(fetched, guild):
             return fetched
         return None
 
@@ -1242,6 +1267,7 @@ class VoiceCog(commands.Cog):
             if (
                 _is_voice_notify_sendable_channel(channel)
                 and channel.guild.id == guild_id_int
+                and _can_bot_send_voice_notify_in_guild(channel, channel.guild)
             ):
                 return channel
 
@@ -1254,6 +1280,7 @@ class VoiceCog(commands.Cog):
             if (
                 _is_voice_notify_sendable_channel(fetched)
                 and fetched.guild.id == guild_id_int
+                and _can_bot_send_voice_notify_in_guild(fetched, fetched.guild)
             ):
                 return fetched
         return None
@@ -2451,7 +2478,7 @@ class VoiceCog(commands.Cog):
             return
         if not _can_bot_send_voice_notify(notify, interaction):
             await interaction.response.send_message(
-                "そのチャンネルに送信する権限が Bot にありません。",
+                VOICE_NOTIFY_PERMISSION_ERROR_MESSAGE,
                 ephemeral=True,
             )
             return
@@ -2518,7 +2545,7 @@ class VoiceCog(commands.Cog):
             return
         if not _can_bot_send_voice_notify(notify, interaction):
             await interaction.response.send_message(
-                "そのチャンネルに送信する権限が Bot にありません。",
+                VOICE_NOTIFY_PERMISSION_ERROR_MESSAGE,
                 ephemeral=True,
             )
             return
@@ -2717,7 +2744,7 @@ class VoiceCog(commands.Cog):
             return
         if not _can_bot_send_voice_notify(notify, interaction):
             await interaction.response.send_message(
-                "そのチャンネルに送信する権限が Bot にありません。",
+                VOICE_NOTIFY_PERMISSION_ERROR_MESSAGE,
                 ephemeral=True,
             )
             return

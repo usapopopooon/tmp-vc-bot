@@ -14,6 +14,7 @@ from src.cogs.voice import (
     VC_CREATE_COOLDOWN_SECONDS,
     NumberedLobbyModal,
     VoiceCog,
+    _can_bot_send_voice_notify,
     _cleanup_vc_create_cooldown_cache,
     _vc_create_cooldown_cache,
     clear_vc_create_cooldown_cache,
@@ -1542,6 +1543,31 @@ class TestVoiceNotify:
         assert embed.description == "ほげ さんが <#100> に入室しました。"
         assert embed.url is None
 
+    def test_can_bot_send_voice_notify_requires_embed_links(self) -> None:
+        """通知先設定では Embed 送信権限も必要とする。"""
+        guild = MagicMock(spec=discord.Guild)
+        guild.me = None
+        bot_member = MagicMock(spec=discord.Member)
+        guild.get_member = MagicMock(return_value=bot_member)
+        interaction = _make_interaction(1, guild=guild)
+        interaction.client = MagicMock()
+        interaction.client.user = MagicMock(spec=discord.User)
+        interaction.client.user.id = 9999
+        notify_channel = MagicMock(spec=discord.TextChannel)
+        notify_channel.permissions_for = MagicMock(
+            return_value=discord.Permissions(
+                view_channel=True,
+                send_messages=True,
+                embed_links=False,
+            )
+        )
+
+        can_send = _can_bot_send_voice_notify(notify_channel, interaction)
+
+        assert can_send is False
+        guild.get_member.assert_called_once_with(9999)
+        notify_channel.permissions_for.assert_called_once_with(bot_member)
+
     async def test_handle_voice_notify_sends_leave_then_join(self) -> None:
         """VC 移動時は退出通知のあとに入室通知を処理する。"""
         cog = _make_cog()
@@ -1670,6 +1696,29 @@ class TestVoiceNotify:
             "ほげ さんが [作業鯖](https://discord.gg/test) の 集中部屋 に入室しました。"
         )
         assert embed.url is None
+
+    async def test_fetch_voice_notify_channel_requires_embed_links(self) -> None:
+        """既存設定の通知先取得でも Embed 送信権限を確認する。"""
+        cog = _make_cog()
+        guild = MagicMock(spec=discord.Guild)
+        bot_member = MagicMock(spec=discord.Member)
+        guild.me = bot_member
+        notify_channel = MagicMock(spec=discord.TextChannel)
+        notify_channel.permissions_for = MagicMock(
+            return_value=discord.Permissions(
+                view_channel=True,
+                send_messages=True,
+                embed_links=False,
+            )
+        )
+        guild.get_channel = MagicMock(return_value=notify_channel)
+        guild.fetch_channel = AsyncMock()
+
+        channel = await cog._fetch_voice_notify_sendable_channel(guild, "300")
+
+        assert channel is None
+        notify_channel.permissions_for.assert_called_once_with(bot_member)
+        guild.fetch_channel.assert_not_awaited()
 
     async def test_send_cross_guild_voice_notification_requires_share_enabled(
         self,
@@ -1906,6 +1955,36 @@ class TestVoiceNotify:
         assert channel is notify_channel
         cog.bot.get_guild.assert_called_once_with(2000)
         receiver_bot.get_guild.assert_called_once_with(2000)
+
+    async def test_fetch_cross_guild_voice_notify_channel_requires_embed_links(
+        self,
+    ) -> None:
+        """クロス通知先探索でも Embed 送信権限を確認する。"""
+        cog = _make_cog()
+        cog.bot.get_guild = MagicMock(return_value=None)
+        receiver_guild = MagicMock(spec=discord.Guild)
+        receiver_guild.id = 2000
+        bot_member = MagicMock(spec=discord.Member)
+        receiver_guild.me = bot_member
+        notify_channel = MagicMock(spec=discord.TextChannel)
+        notify_channel.guild = receiver_guild
+        notify_channel.permissions_for = MagicMock(
+            return_value=discord.Permissions(
+                view_channel=True,
+                send_messages=True,
+                embed_links=False,
+            )
+        )
+        cog.bot.get_channel = MagicMock(return_value=notify_channel)
+        cog.bot.fetch_channel = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(status=404), "not found")
+        )
+
+        channel = await cog._fetch_cross_guild_voice_notify_channel("2000", "300")
+
+        assert channel is None
+        notify_channel.permissions_for.assert_called_once_with(bot_member)
+        cog.bot.fetch_channel.assert_awaited_once_with(300)
 
     async def test_send_voice_notification_deduplicates_direct_and_category(
         self,
