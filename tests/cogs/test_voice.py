@@ -28,7 +28,10 @@ from src.utils import clear_resource_locks
 @pytest.fixture(autouse=True)
 def clear_cooldown_cache() -> None:
     """Clear VC create cooldown cache and resource locks before each test."""
+    import src.cogs.voice as voice_module
+
     clear_vc_create_cooldown_cache()
+    voice_module._cross_guild_voice_notify_bots.clear()
     clear_resource_locks()
 
 
@@ -1724,6 +1727,31 @@ class TestVoiceNotify:
         assert notify_channel.send.call_args.args[0] == (
             "ほげ さんが [作業鯖](https://discord.gg/test) の 集中部屋 に入室しました。"
         )
+
+    async def test_fetch_cross_guild_voice_notify_channel_uses_registered_bot(
+        self,
+    ) -> None:
+        """送信元 Bot がいないサーバーは同一プロセスの別 Bot から探す。"""
+        import src.cogs.voice as voice_module
+
+        cog = _make_cog()
+        cog.bot.get_guild = MagicMock(return_value=None)
+
+        receiver_bot = MagicMock(spec=discord.ext.commands.Bot)
+        receiver_bot.is_closed = MagicMock(return_value=False)
+        receiver_guild = MagicMock(spec=discord.Guild)
+        receiver_guild.id = 2000
+        notify_channel = MagicMock(spec=discord.TextChannel)
+        notify_channel.id = 300
+        receiver_guild.get_channel = MagicMock(return_value=notify_channel)
+        receiver_bot.get_guild = MagicMock(return_value=receiver_guild)
+        voice_module._cross_guild_voice_notify_bots.add(receiver_bot)
+
+        channel = await cog._fetch_cross_guild_voice_notify_channel("2000", "300")
+
+        assert channel is notify_channel
+        cog.bot.get_guild.assert_called_once_with(2000)
+        receiver_bot.get_guild.assert_called_once_with(2000)
 
     async def test_send_voice_notification_deduplicates_direct_and_category(
         self,

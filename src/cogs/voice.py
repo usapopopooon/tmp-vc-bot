@@ -18,6 +18,7 @@ import contextlib
 import logging
 import time
 import unicodedata
+import weakref
 from dataclasses import dataclass
 from typing import Any, Literal, TypeGuard
 from urllib.parse import urlparse
@@ -102,6 +103,8 @@ DEFAULT_RTC_REGION = "japan"
 VC_CREATE_COOLDOWN_SECONDS = 30
 
 logger = logging.getLogger(__name__)
+
+_cross_guild_voice_notify_bots: weakref.WeakSet[commands.Bot] = weakref.WeakSet()
 
 _LEGACY_LOBBY_NAME = "➕ 新規VC作成"
 _DIALOG_DEFAULT_LOBBY_NAME = "作業空間作成"
@@ -526,6 +529,7 @@ class VoiceCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        _cross_guild_voice_notify_bots.add(bot)
         # --- 参加時刻のメモリキャッシュ ---
         # DB 読み込み頻度を減らすためのキャッシュ。
         # 構造: {チャンネルID: {ユーザーID: 参加時刻(monotonic)}}
@@ -537,6 +541,30 @@ class VoiceCog(commands.Cog):
         # ロビーチャンネル ID のインメモリキャッシュ
         # None = 未ロード (フォールスルー), set = ロード済み (キャッシュ使用)
         self._lobby_channel_ids: set[str] | None = None
+
+    async def cog_unload(self) -> None:
+        """Cog アンロード時にクロス通知用 Bot レジストリから解除する。"""
+        _cross_guild_voice_notify_bots.discard(self.bot)
+
+    def _iter_cross_guild_voice_notify_bots(self) -> list[commands.Bot]:
+        """クロス通知の送信先探索に使う Bot を現在の Bot 優先で返す。"""
+        bots: list[commands.Bot] = []
+        seen_bot_ids: set[int] = set()
+        for bot in [self.bot, *list(_cross_guild_voice_notify_bots)]:
+            bot_identity = id(bot)
+            if bot_identity in seen_bot_ids:
+                continue
+            seen_bot_ids.add(bot_identity)
+
+            try:
+                is_closed = bot.is_closed()
+            except Exception:
+                is_closed = False
+            if is_closed is True:
+                continue
+
+            bots.append(bot)
+        return bots
 
     # ==========================================================================
     # イベントリスナー
@@ -919,27 +947,36 @@ class VoiceCog(commands.Cog):
         except ValueError:
             return None
 
-        guild = self.bot.get_guild(guild_id_int)
-        if guild is not None:
-            return await self._fetch_voice_notify_sendable_channel(guild, channel_id)
+        for bot in self._iter_cross_guild_voice_notify_bots():
+            guild = bot.get_guild(guild_id_int)
+            if guild is None:
+                continue
+            guild_channel = await self._fetch_voice_notify_sendable_channel(
+                guild,
+                channel_id,
+            )
+            if guild_channel is not None:
+                return guild_channel
 
-        channel = self.bot.get_channel(channel_id_int)
-        if (
-            _is_voice_notify_sendable_channel(channel)
-            and channel.guild.id == guild_id_int
-        ):
-            return channel
+        for bot in self._iter_cross_guild_voice_notify_bots():
+            channel = bot.get_channel(channel_id_int)
+            if (
+                _is_voice_notify_sendable_channel(channel)
+                and channel.guild.id == guild_id_int
+            ):
+                return channel
 
-        try:
-            fetched = await self.bot.fetch_channel(channel_id_int)
-        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
-            return None
+        for bot in self._iter_cross_guild_voice_notify_bots():
+            try:
+                fetched = await bot.fetch_channel(channel_id_int)
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+                continue
 
-        if (
-            _is_voice_notify_sendable_channel(fetched)
-            and fetched.guild.id == guild_id_int
-        ):
-            return fetched
+            if (
+                _is_voice_notify_sendable_channel(fetched)
+                and fetched.guild.id == guild_id_int
+            ):
+                return fetched
         return None
 
     # ==========================================================================
