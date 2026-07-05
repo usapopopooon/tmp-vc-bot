@@ -17,6 +17,7 @@ from src.cogs.voice import (
     _cleanup_vc_create_cooldown_cache,
     _vc_create_cooldown_cache,
     clear_vc_create_cooldown_cache,
+    create_cross_guild_voice_notify_embed,
     create_cross_guild_voice_notify_message,
     create_voice_notify_message,
     is_vc_create_on_cooldown,
@@ -1629,9 +1630,35 @@ class TestVoiceNotify:
         )
 
         assert message == (
-            r"\*ほげ\* さんが \*作業鯖\* の "
+            r"\*ほげ\* さんが [\*作業鯖\*](https://discord.gg/test) の "
             r"\_集中部屋\_ に入室しました。"
         )
+
+    def test_create_cross_guild_voice_notify_embed_uses_description_link(
+        self,
+    ) -> None:
+        """サーバー間通知 Embed は本文でサーバー名を招待 URL にリンクする。"""
+        guild = MagicMock(spec=discord.Guild)
+        guild.name = "作業鯖"
+        voice_channel = _make_channel(100)
+        voice_channel.name = "集中部屋"
+        member = _make_member(1)
+        member.display_name = "ほげ"
+
+        embed = create_cross_guild_voice_notify_embed(
+            guild,
+            member,
+            voice_channel,
+            "join",
+            invite_url="https://discord.gg/test",
+        )
+
+        assert embed.title is None
+        assert embed.description == (
+            "ほげ さんが [作業鯖](https://discord.gg/test) の "
+            "集中部屋 に入室しました。"
+        )
+        assert embed.url is None
 
     async def test_send_cross_guild_voice_notification_requires_share_enabled(
         self,
@@ -1669,10 +1696,10 @@ class TestVoiceNotify:
         mock_get_source.assert_awaited_once_with(mock_session, "1000")
         mock_list_receivers.assert_not_awaited()
 
-    async def test_send_cross_guild_voice_notification_skips_unconfigured_voice(
+    async def test_send_cross_guild_voice_notification_skips_cross_excluded_voice(
         self,
     ) -> None:
-        """通常通知の対象ではない VC はサーバー間通知もしない。"""
+        """サーバー間通知の除外 VC は通知しない。"""
         cog = _make_cog()
         guild = MagicMock(spec=discord.Guild)
         guild.id = 1000
@@ -1690,62 +1717,11 @@ class TestVoiceNotify:
                 return_value=source_config,
             ),
             patch(
-                "src.cogs.voice.list_voice_notify_configs_by_voice_channel",
-                new_callable=AsyncMock,
-                return_value=[],
-            ) as mock_list_voice_configs,
-            patch(
-                "src.cogs.voice.list_voice_notify_cross_guild_receivers",
-                new_callable=AsyncMock,
-            ) as mock_list_receivers,
-        ):
-            sent = await cog._send_cross_guild_voice_notification(
-                guild,
-                member,
-                voice_channel,
-                "join",
-            )
-
-        assert sent is False
-        mock_list_voice_configs.assert_awaited_once_with(mock_session, "1000", "100")
-        mock_list_receivers.assert_not_awaited()
-
-    async def test_send_cross_guild_voice_notification_skips_excluded_category_voice(
-        self,
-    ) -> None:
-        """カテゴリ通知から除外された VC はカテゴリ由来のサーバー間通知をしない。"""
-        cog = _make_cog()
-        guild = MagicMock(spec=discord.Guild)
-        guild.id = 1000
-        voice_channel = _make_channel(100)
-        voice_channel.category_id = 200
-        member = _make_member(1)
-        source_config = MagicMock()
-        source_config.share_enabled = True
-        mock_factory, mock_session = _mock_async_session()
-
-        with (
-            patch("src.cogs.voice.async_session", mock_factory),
-            patch(
-                "src.cogs.voice.get_voice_notify_cross_guild_config",
-                new_callable=AsyncMock,
-                return_value=source_config,
-            ),
-            patch(
-                "src.cogs.voice.list_voice_notify_configs_by_voice_channel",
-                new_callable=AsyncMock,
-                return_value=[],
-            ) as mock_list_voice_configs,
-            patch(
-                "src.cogs.voice.is_voice_notify_excluded",
+                "src.cogs.voice.is_voice_notify_cross_guild_excluded",
                 new_callable=AsyncMock,
                 return_value=True,
             ) as mock_is_excluded,
             patch(
-                "src.cogs.voice.get_voice_notify_category_config",
-                new_callable=AsyncMock,
-            ) as mock_get_category,
-            patch(
                 "src.cogs.voice.list_voice_notify_cross_guild_receivers",
                 new_callable=AsyncMock,
             ) as mock_list_receivers,
@@ -1758,21 +1734,18 @@ class TestVoiceNotify:
             )
 
         assert sent is False
-        mock_list_voice_configs.assert_awaited_once_with(mock_session, "1000", "100")
         mock_is_excluded.assert_awaited_once_with(mock_session, "1000", "100")
-        mock_get_category.assert_not_awaited()
         mock_list_receivers.assert_not_awaited()
 
     async def test_send_cross_guild_voice_notification_sends_to_receivers(
         self,
     ) -> None:
-        """固定 VC 通知対象なら、受信先設定済みサーバーへ通知する。"""
+        """共有 ON の発信元から、受信先設定済みサーバーへ通知する。"""
         cog = _make_cog()
         source_guild = MagicMock(spec=discord.Guild)
         source_guild.id = 1000
         source_guild.name = "作業鯖"
         voice_channel = _make_channel(100)
-        voice_channel.category_id = 200
         voice_channel.name = "集中部屋"
         member = _make_member(1)
         member.display_name = "ほげ"
@@ -1780,8 +1753,6 @@ class TestVoiceNotify:
         source_config = MagicMock()
         source_config.share_enabled = True
         source_config.invite_url = "https://discord.gg/test"
-        direct_config = MagicMock()
-        direct_config.notify_channel_id = "400"
         receiver_config = MagicMock()
         receiver_config.guild_id = "2000"
         receiver_config.notify_channel_id = "300"
@@ -1797,19 +1768,10 @@ class TestVoiceNotify:
                 return_value=source_config,
             ),
             patch(
-                "src.cogs.voice.list_voice_notify_configs_by_voice_channel",
+                "src.cogs.voice.is_voice_notify_cross_guild_excluded",
                 new_callable=AsyncMock,
-                return_value=[direct_config],
-            ) as mock_list_voice_configs,
-            patch(
-                "src.cogs.voice.is_voice_notify_excluded",
-                new_callable=AsyncMock,
-                return_value=True,
+                return_value=False,
             ) as mock_is_excluded,
-            patch(
-                "src.cogs.voice.get_voice_notify_category_config",
-                new_callable=AsyncMock,
-            ) as mock_get_category,
             patch(
                 "src.cogs.voice.list_voice_notify_cross_guild_receivers",
                 new_callable=AsyncMock,
@@ -1827,9 +1789,7 @@ class TestVoiceNotify:
             )
 
         assert sent is True
-        mock_list_voice_configs.assert_awaited_once_with(mock_session, "1000", "100")
         mock_is_excluded.assert_awaited_once_with(mock_session, "1000", "100")
-        mock_get_category.assert_not_awaited()
         mock_list_receivers.assert_awaited_once_with(
             mock_session,
             exclude_guild_id="1000",
@@ -1839,10 +1799,12 @@ class TestVoiceNotify:
             "300",
         )
         notify_channel.send.assert_awaited_once()
-        assert notify_channel.send.call_args.args[0] == (
-            "ほげ さんが 作業鯖 の 集中部屋 に入室しました。"
+        assert notify_channel.send.call_args.args == ()
+        assert notify_channel.send.call_args.kwargs["embed"].title is None
+        assert notify_channel.send.call_args.kwargs["embed"].description == (
+            "ほげ さんが [作業鯖](https://discord.gg/test) の "
+            "集中部屋 に入室しました。"
         )
-        assert "embed" not in notify_channel.send.call_args.kwargs
 
     async def test_send_cross_guild_voice_notification_uses_rest_fallback(
         self,
@@ -1860,8 +1822,6 @@ class TestVoiceNotify:
         source_config = MagicMock()
         source_config.share_enabled = True
         source_config.invite_url = "https://discord.gg/test"
-        direct_config = MagicMock()
-        direct_config.notify_channel_id = "400"
         receiver_config = MagicMock()
         receiver_config.guild_id = "2000"
         receiver_config.notify_channel_id = "300"
@@ -1875,10 +1835,10 @@ class TestVoiceNotify:
                 return_value=source_config,
             ),
             patch(
-                "src.cogs.voice.list_voice_notify_configs_by_voice_channel",
+                "src.cogs.voice.is_voice_notify_cross_guild_excluded",
                 new_callable=AsyncMock,
-                return_value=[direct_config],
-            ) as mock_list_voice_configs,
+                return_value=False,
+            ) as mock_is_excluded,
             patch(
                 "src.cogs.voice.list_voice_notify_cross_guild_receivers",
                 new_callable=AsyncMock,
@@ -1899,15 +1859,21 @@ class TestVoiceNotify:
             )
 
         assert sent is True
-        mock_list_voice_configs.assert_awaited_once_with(mock_session, "1000", "100")
+        mock_is_excluded.assert_awaited_once_with(mock_session, "1000", "100")
         cog._send_cross_guild_voice_notification_via_rest.assert_awaited_once()
         rest_args = cog._send_cross_guild_voice_notification_via_rest.await_args.args
-        assert rest_args[:3] == (
+        rest_kwargs = (
+            cog._send_cross_guild_voice_notification_via_rest.await_args.kwargs
+        )
+        assert rest_args == (
             "2000",
             "300",
-            "ほげ さんが 作業鯖 の 集中部屋 に入室しました。",
         )
-        assert len(rest_args) == 3
+        assert rest_kwargs["embed"].title is None
+        assert rest_kwargs["embed"].description == (
+            "ほげ さんが [作業鯖](https://discord.gg/test) の "
+            "集中部屋 に入室しました。"
+        )
 
     async def test_fetch_cross_guild_voice_notify_channel_uses_registered_bot(
         self,

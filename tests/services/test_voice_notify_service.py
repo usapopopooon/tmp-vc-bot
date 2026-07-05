@@ -15,20 +15,24 @@ from sqlalchemy.ext.asyncio import (
 from src.constants import DEFAULT_TEST_DATABASE_URL
 from src.database.models import Base
 from src.services.db_service import (
+    add_voice_notify_cross_guild_exclude,
     add_voice_notify_exclude,
     delete_voice_notify_by_channel,
     delete_voice_notify_by_guild,
     delete_voice_notify_category_config,
     delete_voice_notify_config,
     delete_voice_notify_cross_guild_config,
+    delete_voice_notify_cross_guild_exclude,
     delete_voice_notify_exclude,
     get_voice_notify_category_config,
     get_voice_notify_config,
     get_voice_notify_cross_guild_config,
+    is_voice_notify_cross_guild_excluded,
     is_voice_notify_excluded,
     list_voice_notify_category_configs,
     list_voice_notify_configs,
     list_voice_notify_configs_by_voice_channel,
+    list_voice_notify_cross_guild_excludes,
     list_voice_notify_cross_guild_receivers,
     list_voice_notify_excludes,
     set_voice_notify_category_config,
@@ -269,6 +273,44 @@ class TestVoiceNotifyCrossGuildOperations:
         assert await delete_voice_notify_cross_guild_config(db_session, "123") is False
         assert await get_voice_notify_cross_guild_config(db_session, "123") is None
 
+    async def test_add_list_check_and_delete_cross_exclude(
+        self,
+        db_session: AsyncSession,
+    ) -> None:
+        """サーバー間通知除外を追加・確認・削除できる。"""
+        exclude = await add_voice_notify_cross_guild_exclude(
+            db_session,
+            "123",
+            "456",
+        )
+        duplicate = await add_voice_notify_cross_guild_exclude(
+            db_session,
+            "123",
+            "456",
+        )
+
+        assert duplicate.id == exclude.id
+        assert (
+            await is_voice_notify_cross_guild_excluded(db_session, "123", "456")
+            is True
+        )
+
+        excludes = await list_voice_notify_cross_guild_excludes(db_session, "123")
+        assert [item.voice_channel_id for item in excludes] == ["456"]
+
+        assert (
+            await delete_voice_notify_cross_guild_exclude(db_session, "123", "456")
+            is True
+        )
+        assert (
+            await delete_voice_notify_cross_guild_exclude(db_session, "123", "456")
+            is False
+        )
+        assert (
+            await is_voice_notify_cross_guild_excluded(db_session, "123", "456")
+            is False
+        )
+
 
 class TestVoiceNotifyCleanupOperations:
     """通知設定の一括クリーンアップテスト。"""
@@ -282,16 +324,18 @@ class TestVoiceNotifyCleanupOperations:
         await set_voice_notify_config(db_session, "123", "111", "456")
         await set_voice_notify_category_config(db_session, "123", "222", "456")
         await add_voice_notify_exclude(db_session, "123", "456")
+        await add_voice_notify_cross_guild_exclude(db_session, "123", "456")
         await set_voice_notify_cross_guild_share(db_session, "123", True)
         await set_voice_notify_cross_guild_channel(db_session, "123", "456")
         await set_voice_notify_config(db_session, "999", "456", "999")
 
         deleted = await delete_voice_notify_by_channel(db_session, "123", "456")
 
-        assert deleted == 5
+        assert deleted == 6
         assert await list_voice_notify_configs(db_session, "123") == []
         assert await list_voice_notify_category_configs(db_session, "123") == []
         assert await list_voice_notify_excludes(db_session, "123") == []
+        assert await list_voice_notify_cross_guild_excludes(db_session, "123") == []
         cross_config = await get_voice_notify_cross_guild_config(db_session, "123")
         assert cross_config is not None
         assert cross_config.share_enabled is True
@@ -306,12 +350,14 @@ class TestVoiceNotifyCleanupOperations:
         await set_voice_notify_config(db_session, "123", "456", "999")
         await set_voice_notify_category_config(db_session, "234", "222", "999")
         await set_voice_notify_cross_guild_channel(db_session, "234", "999")
+        await add_voice_notify_cross_guild_exclude(db_session, "234", "777")
         await add_voice_notify_exclude(db_session, "345", "777")
 
         deleted = await delete_voice_notify_by_guild(db_session, "234")
 
-        assert deleted == 2
+        assert deleted == 3
         assert await list_voice_notify_category_configs(db_session, "234") == []
         assert await get_voice_notify_cross_guild_config(db_session, "234") is None
+        assert await list_voice_notify_cross_guild_excludes(db_session, "234") == []
         assert len(await list_voice_notify_configs(db_session, "123")) == 1
         assert len(await list_voice_notify_excludes(db_session, "345")) == 1

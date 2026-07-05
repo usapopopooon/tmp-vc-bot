@@ -23,7 +23,8 @@ Discord の **一時ボイスチャンネル (Ephemeral VC) 機能だけ** を�
     変更可能な機能 `人数のみ` を入力
 - `/voice-notify` — VC 入退室通知をサーバー内の指定テキストチャンネルへ送信
 - `/voice-notify-cross` — 通常通知とは別設定で、共有 ON のサーバーの VC 入退室を
-  受信先設定済みの他サーバーへ通知。サーバー名リンクには管理者が設定した固定招待 URL を使う
+  受信先設定済みの他サーバーへ通知。サーバー名リンクには管理者が設定した固定招待 URL を使う。
+  除外 VC は `/voice-notify-cross exclude-add` / `exclude-remove` で別管理
 - マルチインスタンス対応 (`processed_events` テーブルでアトミック重複排除)
 - Bot 再起動後もコントロールパネルのボタンが動作 (永続 View)
 

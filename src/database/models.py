@@ -354,6 +354,43 @@ class VoiceNotifyCrossGuildConfig(Base):
         )
 
 
+class VoiceNotifyCrossGuildExclude(Base):
+    """サーバー間通知から除外する VC テーブル。"""
+
+    __tablename__ = "voice_notify_cross_guild_excludes"
+    __table_args__ = (
+        UniqueConstraint(
+            "guild_id",
+            "voice_channel_id",
+            name="uq_voice_notify_cross_guild_exclude_guild_voice_channel",
+        ),
+        Index("ix_voice_notify_cross_guild_excludes_guild_id", "guild_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    guild_id: Mapped[str] = mapped_column(String, nullable=False)
+    voice_channel_id: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    @validates("guild_id", "voice_channel_id")
+    def _validate_ids(self, key: str, value: str) -> str:
+        return _validate_discord_id(value, key)
+
+    def __repr__(self) -> str:
+        return (
+            f"<VoiceNotifyCrossGuildExclude(id={self.id}, "
+            f"guild_id={self.guild_id}, voice_channel_id={self.voice_channel_id})>"
+        )
+
+
 class ProcessedEvent(Base):
     """重複排除テーブル (マルチインスタンス重複防止)。
 

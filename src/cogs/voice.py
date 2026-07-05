@@ -55,6 +55,7 @@ from src.core.lobby_config import (
 from src.database.engine import async_session
 from src.database.models import Lobby, VoiceSession
 from src.services.db_service import (
+    add_voice_notify_cross_guild_exclude,
     add_voice_notify_exclude,
     add_voice_session_member,
     claim_event,
@@ -66,6 +67,7 @@ from src.services.db_service import (
     delete_voice_notify_by_guild,
     delete_voice_notify_category_config,
     delete_voice_notify_config,
+    delete_voice_notify_cross_guild_exclude,
     delete_voice_notify_exclude,
     delete_voice_session,
     delete_voice_sessions_by_guild,
@@ -77,10 +79,12 @@ from src.services.db_service import (
     get_voice_session,
     get_voice_session_members_ordered,
     get_voice_sessions_by_lobby,
+    is_voice_notify_cross_guild_excluded,
     is_voice_notify_excluded,
     list_voice_notify_category_configs,
     list_voice_notify_configs,
     list_voice_notify_configs_by_voice_channel,
+    list_voice_notify_cross_guild_excludes,
     list_voice_notify_cross_guild_receivers,
     list_voice_notify_excludes,
     remove_voice_session_member,
@@ -443,6 +447,8 @@ def _escape_voice_notify_text(value: str) -> str:
 def _voice_notify_guild_label(label: str, _invite_url: str | None) -> str:
     """サーバー間通知本文に表示するサーバー名を返す。"""
     escaped_label = _escape_voice_notify_text(label)
+    if _invite_url is not None:
+        return f"[{escaped_label}]({_invite_url})"
     return escaped_label
 
 
@@ -475,6 +481,25 @@ def create_cross_guild_voice_notify_message(
     if event_type == "join":
         return f"{display_name} さんが {guild_name} の {channel_name} に入室しました。"
     return f"{display_name} さんが {guild_name} の {channel_name} から退室しました。"
+
+
+def create_cross_guild_voice_notify_embed(
+    guild: discord.Guild,
+    member: discord.Member,
+    voice_channel: discord.VoiceChannel | discord.StageChannel,
+    event_type: VoiceNotifyEventType,
+    invite_url: str | None = None,
+) -> discord.Embed:
+    """サーバー間 VC 入退室通知の Embed を作成する。"""
+    return discord.Embed(
+        description=create_cross_guild_voice_notify_message(
+            guild,
+            member,
+            voice_channel,
+            event_type,
+            invite_url=invite_url,
+        )
+    )
 
 
 def _is_voice_notify_voice_channel(
@@ -878,11 +903,37 @@ class VoiceCog(commands.Cog):
         voice_channel_id = str(voice_channel.id)
 
         async with async_session() as session:
-            notify_channel_ids = await self._list_voice_notify_target_channel_ids(
+            voice_configs = await list_voice_notify_configs_by_voice_channel(
                 session,
                 guild_id,
-                voice_channel,
+                voice_channel_id,
             )
+
+            category_config = None
+            category_id = _voice_notify_category_id(voice_channel)
+            if category_id is not None and not await is_voice_notify_excluded(
+                session,
+                guild_id,
+                voice_channel_id,
+            ):
+                category_config = await get_voice_notify_category_config(
+                    session,
+                    guild_id,
+                    category_id,
+                )
+
+        notify_channel_ids: list[str] = []
+        seen_notify_channel_ids: set[str] = set()
+        for config in voice_configs:
+            if config.notify_channel_id in seen_notify_channel_ids:
+                continue
+            seen_notify_channel_ids.add(config.notify_channel_id)
+            notify_channel_ids.append(config.notify_channel_id)
+        if (
+            category_config is not None
+            and category_config.notify_channel_id not in seen_notify_channel_ids
+        ):
+            notify_channel_ids.append(category_config.notify_channel_id)
 
         if not notify_channel_ids:
             return False
@@ -921,48 +972,6 @@ class VoiceCog(commands.Cog):
 
         return sent
 
-    async def _list_voice_notify_target_channel_ids(
-        self,
-        session: AsyncSession,
-        guild_id: str,
-        voice_channel: discord.VoiceChannel | discord.StageChannel,
-    ) -> list[str]:
-        """通常 VC 通知の設定に基づく通知先チャンネル ID を返す。"""
-        voice_channel_id = str(voice_channel.id)
-        voice_configs = await list_voice_notify_configs_by_voice_channel(
-            session,
-            guild_id,
-            voice_channel_id,
-        )
-
-        category_config = None
-        category_id = _voice_notify_category_id(voice_channel)
-        if category_id is not None and not await is_voice_notify_excluded(
-            session,
-            guild_id,
-            voice_channel_id,
-        ):
-            category_config = await get_voice_notify_category_config(
-                session,
-                guild_id,
-                category_id,
-            )
-
-        notify_channel_ids: list[str] = []
-        seen_notify_channel_ids: set[str] = set()
-        for config in voice_configs:
-            if config.notify_channel_id in seen_notify_channel_ids:
-                continue
-            seen_notify_channel_ids.add(config.notify_channel_id)
-            notify_channel_ids.append(config.notify_channel_id)
-        if (
-            category_config is not None
-            and category_config.notify_channel_id not in seen_notify_channel_ids
-        ):
-            notify_channel_ids.append(category_config.notify_channel_id)
-
-        return notify_channel_ids
-
     async def _fetch_voice_notify_sendable_channel(
         self,
         guild: discord.Guild,
@@ -996,6 +1005,7 @@ class VoiceCog(commands.Cog):
     ) -> bool:
         """共有 ON のサーバーの VC 入退室を、受信設定済みサーバーへ通知する。"""
         guild_id = str(guild.id)
+        voice_channel_id = str(voice_channel.id)
 
         async with async_session() as session:
             source_config = await get_voice_notify_cross_guild_config(
@@ -1005,14 +1015,11 @@ class VoiceCog(commands.Cog):
             if source_config is None or not source_config.share_enabled:
                 return False
 
-            source_notify_channel_ids = (
-                await self._list_voice_notify_target_channel_ids(
-                    session,
-                    guild_id,
-                    voice_channel,
-                )
-            )
-            if not source_notify_channel_ids:
+            if await is_voice_notify_cross_guild_excluded(
+                session,
+                guild_id,
+                voice_channel_id,
+            ):
                 return False
 
             receiver_configs = await list_voice_notify_cross_guild_receivers(
@@ -1028,7 +1035,7 @@ class VoiceCog(commands.Cog):
             if isinstance(source_config.invite_url, str) and source_config.invite_url
             else None
         )
-        content = create_cross_guild_voice_notify_message(
+        embed = create_cross_guild_voice_notify_embed(
             guild,
             member,
             voice_channel,
@@ -1047,7 +1054,7 @@ class VoiceCog(commands.Cog):
                 if await self._send_cross_guild_voice_notification_via_rest(
                     config.guild_id,
                     config.notify_channel_id,
-                    content,
+                    embed=embed,
                 ):
                     sent = True
                     continue
@@ -1067,7 +1074,7 @@ class VoiceCog(commands.Cog):
 
             try:
                 await channel.send(
-                    content,
+                    embed=embed,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 sent = True
@@ -1075,7 +1082,7 @@ class VoiceCog(commands.Cog):
                 if await self._send_cross_guild_voice_notification_via_rest(
                     config.guild_id,
                     config.notify_channel_id,
-                    content,
+                    embed=embed,
                 ):
                     sent = True
                     continue
@@ -1095,10 +1102,14 @@ class VoiceCog(commands.Cog):
         self,
         guild_id: str,
         channel_id: str,
-        content: str,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
     ) -> bool:
         """Bot クライアントのキャッシュ経由で送れない場合に REST で送信する。"""
         from src.config import settings
+
+        if content is None and embed is None:
+            return False
 
         try:
             guild_id_int = int(guild_id)
@@ -1146,10 +1157,11 @@ class VoiceCog(commands.Cog):
                     continue
 
                 message_url = f"{channel_url}/messages"
-                payload: dict[str, Any] = {
-                    "content": content,
-                    "allowed_mentions": {"parse": []},
-                }
+                payload: dict[str, Any] = {"allowed_mentions": {"parse": []}}
+                if content is not None:
+                    payload["content"] = content
+                if embed is not None:
+                    payload["embeds"] = [embed.to_dict()]
                 try:
                     async with http.post(
                         message_url,
@@ -2773,6 +2785,59 @@ class VoiceCog(commands.Cog):
         await interaction.response.send_message(content, ephemeral=True)
 
     @voice_notify_cross_group.command(
+        name="exclude-add",
+        description="サーバー間通知から除外するVCを追加します",
+    )
+    async def voice_notify_cross_exclude_add(
+        self,
+        interaction: discord.Interaction,
+        voice: discord.VoiceChannel | discord.StageChannel,
+    ) -> None:
+        """サーバー間 VC 入退室通知の除外 VC を追加する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            await add_voice_notify_cross_guild_exclude(
+                session,
+                str(interaction.guild_id),
+                str(voice.id),
+            )
+
+        await interaction.response.send_message(
+            f"サーバー間VC入退室通知の除外VCに追加しました。除外VC: <#{voice.id}>",
+            ephemeral=True,
+        )
+
+    @voice_notify_cross_group.command(
+        name="exclude-remove",
+        description="サーバー間通知の除外VCを解除します",
+    )
+    async def voice_notify_cross_exclude_remove(
+        self,
+        interaction: discord.Interaction,
+        voice: discord.VoiceChannel | discord.StageChannel,
+    ) -> None:
+        """サーバー間 VC 入退室通知の除外 VC を削除する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            removed = await delete_voice_notify_cross_guild_exclude(
+                session,
+                str(interaction.guild_id),
+                str(voice.id),
+            )
+
+        content = (
+            f"サーバー間VC入退室通知の除外VCを解除しました。除外VC: <#{voice.id}>"
+            if removed
+            else "そのVCはサーバー間VC入退室通知の除外対象に設定されていません。"
+            f"除外VC: <#{voice.id}>"
+        )
+        await interaction.response.send_message(content, ephemeral=True)
+
+    @voice_notify_cross_group.command(
         name="receive-remove",
         description="サーバー間VC入退室通知の受信先を解除します",
     )
@@ -2821,30 +2886,42 @@ class VoiceCog(commands.Cog):
                 session,
                 str(interaction.guild_id),
             )
+            excludes = await list_voice_notify_cross_guild_excludes(
+                session,
+                str(interaction.guild_id),
+            )
 
-        if config is None:
+        if config is None and not excludes:
             await interaction.response.send_message(
                 "サーバー間VC入退室通知は設定されていません。",
                 ephemeral=True,
             )
             return
 
-        share_status = "ON" if config.share_enabled else "OFF"
+        share_status = "ON" if config is not None and config.share_enabled else "OFF"
         receive_status = (
             f"<#{config.notify_channel_id}>"
-            if config.notify_channel_id is not None
+            if config is not None and config.notify_channel_id is not None
             else "未設定"
         )
-        invite_status = "設定済み" if config.invite_url is not None else "未設定"
+        invite_status = (
+            "設定済み"
+            if config is not None and config.invite_url is not None
+            else "未設定"
+        )
+        exclude_lines = _format_limited_voice_notify_lines(
+            [f"・<#{exclude.voice_channel_id}>" for exclude in excludes]
+        )
+        lines = [
+            "サーバー間VC入退室通知の設定:",
+            f"共有: {share_status}",
+            f"受信先: {receive_status}",
+            f"招待URL: {invite_status}",
+        ]
+        if exclude_lines:
+            lines.extend(["除外VC:", *exclude_lines])
         await interaction.response.send_message(
-            "\n".join(
-                [
-                    "サーバー間VC入退室通知の設定:",
-                    f"共有: {share_status}",
-                    f"受信先: {receive_status}",
-                    f"招待URL: {invite_status}",
-                ]
-            ),
+            "\n".join(lines),
             ephemeral=True,
         )
 

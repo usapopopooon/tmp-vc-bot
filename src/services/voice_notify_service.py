@@ -9,21 +9,26 @@ from src.database.models import (
     VoiceNotifyCategoryConfig,
     VoiceNotifyConfig,
     VoiceNotifyCrossGuildConfig,
+    VoiceNotifyCrossGuildExclude,
     VoiceNotifyExclude,
 )
 
 __all__ = [
+    "add_voice_notify_cross_guild_exclude",
     "add_voice_notify_exclude",
     "delete_voice_notify_by_channel",
     "delete_voice_notify_by_guild",
     "delete_voice_notify_category_config",
     "delete_voice_notify_config",
     "delete_voice_notify_cross_guild_config",
+    "delete_voice_notify_cross_guild_exclude",
     "delete_voice_notify_exclude",
     "get_voice_notify_cross_guild_config",
     "get_voice_notify_category_config",
     "get_voice_notify_config",
+    "is_voice_notify_cross_guild_excluded",
     "is_voice_notify_excluded",
+    "list_voice_notify_cross_guild_excludes",
     "list_voice_notify_cross_guild_receivers",
     "list_voice_notify_category_configs",
     "list_voice_notify_configs",
@@ -347,6 +352,77 @@ async def list_voice_notify_cross_guild_receivers(
     return list(result.scalars().all())
 
 
+async def list_voice_notify_cross_guild_excludes(
+    session: AsyncSession,
+    guild_id: str,
+) -> list[VoiceNotifyCrossGuildExclude]:
+    """サーバー間通知の除外 VC を作成順に取得する。"""
+    result = await session.execute(
+        select(VoiceNotifyCrossGuildExclude)
+        .where(VoiceNotifyCrossGuildExclude.guild_id == guild_id)
+        .order_by(
+            VoiceNotifyCrossGuildExclude.created_at,
+            VoiceNotifyCrossGuildExclude.id,
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def is_voice_notify_cross_guild_excluded(
+    session: AsyncSession,
+    guild_id: str,
+    voice_channel_id: str,
+) -> bool:
+    """指定 VC がサーバー間通知の除外対象かを返す。"""
+    result = await session.execute(
+        select(VoiceNotifyCrossGuildExclude.id).where(
+            VoiceNotifyCrossGuildExclude.guild_id == guild_id,
+            VoiceNotifyCrossGuildExclude.voice_channel_id == voice_channel_id,
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def add_voice_notify_cross_guild_exclude(
+    session: AsyncSession,
+    guild_id: str,
+    voice_channel_id: str,
+) -> VoiceNotifyCrossGuildExclude:
+    """サーバー間通知の除外 VC を追加する。既存ならそのまま返す。"""
+    result = await session.execute(
+        select(VoiceNotifyCrossGuildExclude).where(
+            VoiceNotifyCrossGuildExclude.guild_id == guild_id,
+            VoiceNotifyCrossGuildExclude.voice_channel_id == voice_channel_id,
+        )
+    )
+    exclude = result.scalar_one_or_none()
+    if exclude is None:
+        exclude = VoiceNotifyCrossGuildExclude(
+            guild_id=guild_id,
+            voice_channel_id=voice_channel_id,
+        )
+        session.add(exclude)
+        await session.commit()
+        await session.refresh(exclude)
+    return exclude
+
+
+async def delete_voice_notify_cross_guild_exclude(
+    session: AsyncSession,
+    guild_id: str,
+    voice_channel_id: str,
+) -> bool:
+    """サーバー間通知の除外 VC を削除する。"""
+    result = await session.execute(
+        delete(VoiceNotifyCrossGuildExclude).where(
+            VoiceNotifyCrossGuildExclude.guild_id == guild_id,
+            VoiceNotifyCrossGuildExclude.voice_channel_id == voice_channel_id,
+        )
+    )
+    await session.commit()
+    return _rowcount(result) > 0
+
+
 async def delete_voice_notify_cross_guild_config(
     session: AsyncSession,
     guild_id: str,
@@ -377,6 +453,11 @@ async def delete_voice_notify_by_guild(
     exclude_result = await session.execute(
         delete(VoiceNotifyExclude).where(VoiceNotifyExclude.guild_id == guild_id)
     )
+    cross_exclude_result = await session.execute(
+        delete(VoiceNotifyCrossGuildExclude).where(
+            VoiceNotifyCrossGuildExclude.guild_id == guild_id
+        )
+    )
     cross_result = await session.execute(
         delete(VoiceNotifyCrossGuildConfig).where(
             VoiceNotifyCrossGuildConfig.guild_id == guild_id
@@ -387,6 +468,7 @@ async def delete_voice_notify_by_guild(
         _rowcount(voice_result)
         + _rowcount(category_result)
         + _rowcount(exclude_result)
+        + _rowcount(cross_exclude_result)
         + _rowcount(cross_result)
     )
 
@@ -421,6 +503,12 @@ async def delete_voice_notify_by_channel(
             VoiceNotifyExclude.voice_channel_id == channel_id,
         )
     )
+    cross_exclude_result = await session.execute(
+        delete(VoiceNotifyCrossGuildExclude).where(
+            VoiceNotifyCrossGuildExclude.guild_id == guild_id,
+            VoiceNotifyCrossGuildExclude.voice_channel_id == channel_id,
+        )
+    )
     cross_result = await session.execute(
         update(VoiceNotifyCrossGuildConfig)
         .where(
@@ -434,5 +522,6 @@ async def delete_voice_notify_by_channel(
         _rowcount(voice_result)
         + _rowcount(category_result)
         + _rowcount(exclude_result)
+        + _rowcount(cross_exclude_result)
         + _rowcount(cross_result)
     )
