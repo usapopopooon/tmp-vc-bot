@@ -878,37 +878,11 @@ class VoiceCog(commands.Cog):
         voice_channel_id = str(voice_channel.id)
 
         async with async_session() as session:
-            voice_configs = await list_voice_notify_configs_by_voice_channel(
+            notify_channel_ids = await self._list_voice_notify_target_channel_ids(
                 session,
                 guild_id,
-                voice_channel_id,
+                voice_channel,
             )
-
-            category_config = None
-            category_id = _voice_notify_category_id(voice_channel)
-            if category_id is not None and not await is_voice_notify_excluded(
-                session,
-                guild_id,
-                voice_channel_id,
-            ):
-                category_config = await get_voice_notify_category_config(
-                    session,
-                    guild_id,
-                    category_id,
-                )
-
-        notify_channel_ids: list[str] = []
-        seen_notify_channel_ids: set[str] = set()
-        for config in voice_configs:
-            if config.notify_channel_id in seen_notify_channel_ids:
-                continue
-            seen_notify_channel_ids.add(config.notify_channel_id)
-            notify_channel_ids.append(config.notify_channel_id)
-        if (
-            category_config is not None
-            and category_config.notify_channel_id not in seen_notify_channel_ids
-        ):
-            notify_channel_ids.append(category_config.notify_channel_id)
 
         if not notify_channel_ids:
             return False
@@ -946,6 +920,48 @@ class VoiceCog(commands.Cog):
                 )
 
         return sent
+
+    async def _list_voice_notify_target_channel_ids(
+        self,
+        session: AsyncSession,
+        guild_id: str,
+        voice_channel: discord.VoiceChannel | discord.StageChannel,
+    ) -> list[str]:
+        """通常 VC 通知の設定に基づく通知先チャンネル ID を返す。"""
+        voice_channel_id = str(voice_channel.id)
+        voice_configs = await list_voice_notify_configs_by_voice_channel(
+            session,
+            guild_id,
+            voice_channel_id,
+        )
+
+        category_config = None
+        category_id = _voice_notify_category_id(voice_channel)
+        if category_id is not None and not await is_voice_notify_excluded(
+            session,
+            guild_id,
+            voice_channel_id,
+        ):
+            category_config = await get_voice_notify_category_config(
+                session,
+                guild_id,
+                category_id,
+            )
+
+        notify_channel_ids: list[str] = []
+        seen_notify_channel_ids: set[str] = set()
+        for config in voice_configs:
+            if config.notify_channel_id in seen_notify_channel_ids:
+                continue
+            seen_notify_channel_ids.add(config.notify_channel_id)
+            notify_channel_ids.append(config.notify_channel_id)
+        if (
+            category_config is not None
+            and category_config.notify_channel_id not in seen_notify_channel_ids
+        ):
+            notify_channel_ids.append(category_config.notify_channel_id)
+
+        return notify_channel_ids
 
     async def _fetch_voice_notify_sendable_channel(
         self,
@@ -987,6 +1003,16 @@ class VoiceCog(commands.Cog):
                 guild_id,
             )
             if source_config is None or not source_config.share_enabled:
+                return False
+
+            source_notify_channel_ids = (
+                await self._list_voice_notify_target_channel_ids(
+                    session,
+                    guild_id,
+                    voice_channel,
+                )
+            )
+            if not source_notify_channel_ids:
                 return False
 
             receiver_configs = await list_voice_notify_cross_guild_receivers(
