@@ -1629,7 +1629,7 @@ class TestVoiceNotify:
         )
 
         assert message == (
-            r"\*ほげ\* さんが [\*作業鯖\*](https://discord.gg/test) の "
+            r"\*ほげ\* さんが \*作業鯖\* https://discord.gg/test の "
             r"\_集中部屋\_ に入室しました。"
         )
 
@@ -1726,7 +1726,7 @@ class TestVoiceNotify:
         )
         notify_channel.send.assert_awaited_once()
         assert notify_channel.send.call_args.args[0] == (
-            "ほげ さんが [作業鯖](https://discord.gg/test) の 集中部屋 に入室しました。"
+            "ほげ さんが 作業鯖 https://discord.gg/test の 集中部屋 に入室しました。"
         )
 
     async def test_send_cross_guild_voice_notification_uses_rest_fallback(

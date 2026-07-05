@@ -441,13 +441,11 @@ def _escape_voice_notify_text(value: str) -> str:
 
 
 def _voice_notify_invite_link(label: str, invite_url: str | None) -> str:
-    """招待 URL があればラベルを Discord のマスクリンクにする。"""
-    escaped_label = (
-        _escape_voice_notify_text(label).replace("[", r"\[").replace("]", r"\]")
-    )
+    """招待 URL があればクリック可能な裸 URL として添える。"""
+    escaped_label = _escape_voice_notify_text(label)
     if invite_url is None:
         return escaped_label
-    return f"[{escaped_label}]({invite_url})"
+    return f"{escaped_label} {invite_url}"
 
 
 def _is_discord_invite_url(value: str) -> bool:
