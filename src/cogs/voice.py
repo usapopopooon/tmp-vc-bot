@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import time
@@ -105,6 +106,7 @@ VC_CREATE_COOLDOWN_SECONDS = 30
 logger = logging.getLogger(__name__)
 
 _cross_guild_voice_notify_bots: weakref.WeakSet[commands.Bot] = weakref.WeakSet()
+_CROSS_GUILD_VOICE_NOTIFY_READY_WAIT_SECONDS = 5.0
 
 _LEGACY_LOBBY_NAME = "➕ 新規VC作成"
 _DIALOG_DEFAULT_LOBBY_NAME = "作業空間作成"
@@ -566,9 +568,108 @@ class VoiceCog(commands.Cog):
             bots.append(bot)
         return bots
 
+    async def _wait_for_cross_guild_voice_notify_bots(
+        self,
+        bots: list[commands.Bot],
+    ) -> None:
+        """クロス通知探索前に、同時起動中 Bot の ready を短時間だけ待つ。"""
+        for bot in bots:
+            try:
+                if bot.is_ready():
+                    continue
+            except Exception:
+                continue
+
+            try:
+                await asyncio.wait_for(
+                    bot.wait_until_ready(),
+                    timeout=_CROSS_GUILD_VOICE_NOTIFY_READY_WAIT_SECONDS,
+                )
+            except (TimeoutError, RuntimeError):
+                continue
+
+    def _format_cross_guild_voice_notify_lookup(
+        self,
+        guild_id: str,
+        channel_id: str,
+    ) -> str:
+        """クロス通知の送信先探索に失敗したときの診断情報を作る。"""
+        try:
+            guild_id_int = int(guild_id)
+            channel_id_int = int(channel_id)
+        except ValueError:
+            return "invalid_ids=true"
+
+        details: list[str] = []
+        for bot in self._iter_cross_guild_voice_notify_bots():
+            bot_user = getattr(bot, "user", None)
+            bot_user_id = getattr(bot_user, "id", "unknown")
+            ready: bool | str
+            try:
+                ready = bot.is_ready()
+            except Exception:
+                ready = "unknown"
+
+            try:
+                guild = bot.get_guild(guild_id_int)
+            except Exception:
+                guild = None
+
+            if guild is None:
+                guilds = getattr(bot, "guilds", [])
+                try:
+                    guild_count: int | str = len(guilds)
+                except TypeError:
+                    guild_count = "unknown"
+                details.append(
+                    f"bot={bot_user_id} ready={ready} "
+                    f"receiver_guild=no guild_count={guild_count}"
+                )
+                continue
+
+            try:
+                channel = guild.get_channel(channel_id_int)
+            except Exception:
+                channel = None
+            channel_type = type(channel).__name__ if channel is not None else "none"
+            permission_status = "unknown"
+            if _is_voice_notify_sendable_channel(channel):
+                bot_member = guild.me
+                if bot_member is None and isinstance(bot_user_id, int):
+                    bot_member = guild.get_member(bot_user_id)
+                if bot_member is not None:
+                    permissions = channel.permissions_for(bot_member)
+                    permission_status = (
+                        f"view={permissions.view_channel} "
+                        f"send={permissions.send_messages}"
+                    )
+
+            details.append(
+                f"bot={bot_user_id} ready={ready} "
+                f"receiver_guild=yes channel={channel_type} "
+                f"perms={permission_status}"
+            )
+
+        if not details:
+            return "bots=none"
+        return " | ".join(details)
+
     # ==========================================================================
     # イベントリスナー
     # ==========================================================================
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        """クロス通知の切り分け用に Bot ごとの所属 guild を記録する。"""
+        bot_user = getattr(self.bot, "user", None)
+        bot_user_id = getattr(bot_user, "id", "unknown")
+        guild_ids = sorted(guild.id for guild in self.bot.guilds)
+        logger.info(
+            "VoiceCog ready: bot=%s guilds=%s cross_registry=%d",
+            bot_user_id,
+            guild_ids,
+            len(_cross_guild_voice_notify_bots),
+        )
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -910,10 +1011,14 @@ class VoiceCog(commands.Cog):
             if channel is None:
                 logger.warning(
                     "Cross-guild voice notify channel is not sendable: "
-                    "source_guild=%s receiver_guild=%s notify=%s",
+                    "source_guild=%s receiver_guild=%s notify=%s lookup=%s",
                     guild_id,
                     config.guild_id,
                     config.notify_channel_id,
+                    self._format_cross_guild_voice_notify_lookup(
+                        config.guild_id,
+                        config.notify_channel_id,
+                    ),
                 )
                 continue
 
@@ -947,7 +1052,11 @@ class VoiceCog(commands.Cog):
         except ValueError:
             return None
 
-        for bot in self._iter_cross_guild_voice_notify_bots():
+        bots = self._iter_cross_guild_voice_notify_bots()
+        await self._wait_for_cross_guild_voice_notify_bots(bots)
+        bots = self._iter_cross_guild_voice_notify_bots()
+
+        for bot in bots:
             guild = bot.get_guild(guild_id_int)
             if guild is None:
                 continue
@@ -958,7 +1067,7 @@ class VoiceCog(commands.Cog):
             if guild_channel is not None:
                 return guild_channel
 
-        for bot in self._iter_cross_guild_voice_notify_bots():
+        for bot in bots:
             channel = bot.get_channel(channel_id_int)
             if (
                 _is_voice_notify_sendable_channel(channel)
@@ -966,7 +1075,7 @@ class VoiceCog(commands.Cog):
             ):
                 return channel
 
-        for bot in self._iter_cross_guild_voice_notify_bots():
+        for bot in bots:
             try:
                 fetched = await bot.fetch_channel(channel_id_int)
             except (discord.Forbidden, discord.HTTPException, discord.NotFound):
