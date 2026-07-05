@@ -108,6 +108,17 @@ logger = logging.getLogger(__name__)
 _cross_guild_voice_notify_bots: weakref.WeakSet[commands.Bot] = weakref.WeakSet()
 _CROSS_GUILD_VOICE_NOTIFY_READY_WAIT_SECONDS = 5.0
 
+
+def register_cross_guild_voice_notify_bot(bot: commands.Bot) -> None:
+    """同一プロセス内の Bot をクロス通知の送信候補として登録する。"""
+    _cross_guild_voice_notify_bots.add(bot)
+
+
+def unregister_cross_guild_voice_notify_bot(bot: commands.Bot) -> None:
+    """クロス通知の送信候補から Bot を外す。"""
+    _cross_guild_voice_notify_bots.discard(bot)
+
+
 _LEGACY_LOBBY_NAME = "➕ 新規VC作成"
 _DIALOG_DEFAULT_LOBBY_NAME = "作業空間作成"
 _DIALOG_DEFAULT_ROOM_PREFIX = "作業空間"
@@ -531,7 +542,7 @@ class VoiceCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        _cross_guild_voice_notify_bots.add(bot)
+        register_cross_guild_voice_notify_bot(bot)
         # --- 参加時刻のメモリキャッシュ ---
         # DB 読み込み頻度を減らすためのキャッシュ。
         # 構造: {チャンネルID: {ユーザーID: 参加時刻(monotonic)}}
@@ -546,7 +557,7 @@ class VoiceCog(commands.Cog):
 
     async def cog_unload(self) -> None:
         """Cog アンロード時にクロス通知用 Bot レジストリから解除する。"""
-        _cross_guild_voice_notify_bots.discard(self.bot)
+        unregister_cross_guild_voice_notify_bot(self.bot)
 
     def _iter_cross_guild_voice_notify_bots(self) -> list[commands.Bot]:
         """クロス通知の送信先探索に使う Bot を現在の Bot 優先で返す。"""

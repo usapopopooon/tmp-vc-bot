@@ -21,6 +21,7 @@ from src.cogs.voice import (
     create_voice_notify_message,
     is_vc_create_on_cooldown,
     record_vc_create_cooldown,
+    register_cross_guild_voice_notify_bot,
 )
 from src.utils import clear_resource_locks
 
@@ -1732,8 +1733,6 @@ class TestVoiceNotify:
         self,
     ) -> None:
         """送信元 Bot がいないサーバーは同一プロセスの別 Bot から探す。"""
-        import src.cogs.voice as voice_module
-
         cog = _make_cog()
         cog.bot.get_guild = MagicMock(return_value=None)
 
@@ -1745,7 +1744,7 @@ class TestVoiceNotify:
         notify_channel.id = 300
         receiver_guild.get_channel = MagicMock(return_value=notify_channel)
         receiver_bot.get_guild = MagicMock(return_value=receiver_guild)
-        voice_module._cross_guild_voice_notify_bots.add(receiver_bot)
+        register_cross_guild_voice_notify_bot(receiver_bot)
 
         channel = await cog._fetch_cross_guild_voice_notify_channel("2000", "300")
 

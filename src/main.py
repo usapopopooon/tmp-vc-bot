@@ -39,6 +39,7 @@ from alembic.config import Config
 
 from alembic import command
 from src.bot import EphemeralVCBot
+from src.cogs.voice import register_cross_guild_voice_notify_bot
 from src.config import settings
 from src.database.engine import check_database_connection_with_retry
 
@@ -181,6 +182,8 @@ async def main() -> None:
     tokens = settings.discord_tokens
     logger.info("Starting %d bot instance(s)", len(tokens))
     _bots = [EphemeralVCBot() for _ in tokens]
+    for bot in _bots:
+        register_cross_guild_voice_notify_bot(bot)
     tasks = [
         asyncio.create_task(_run_bot(token, bot), name=f"bot-start-{index}")
         for index, (token, bot) in enumerate(zip(tokens, _bots, strict=True), start=1)
