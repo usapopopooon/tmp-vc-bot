@@ -477,27 +477,6 @@ def create_cross_guild_voice_notify_message(
     return f"{display_name} さんが {guild_name} の {channel_name} から退室しました。"
 
 
-def create_cross_guild_voice_notify_embed(
-    guild: discord.Guild,
-    voice_channel: discord.VoiceChannel | discord.StageChannel,
-    event_type: VoiceNotifyEventType,
-    invite_url: str | None = None,
-) -> discord.Embed | None:
-    """サーバー間 VC 入退室通知に添える招待リンク用 Embed を作成する。"""
-    if invite_url is None:
-        return None
-
-    color = discord.Color.green() if event_type == "join" else discord.Color.orange()
-    embed = discord.Embed(
-        title=_escape_voice_notify_text(guild.name),
-        url=invite_url,
-        description=f"部屋: {_escape_voice_notify_text(voice_channel.name)}",
-        color=color,
-    )
-    embed.set_footer(text="サーバー名を押すと招待リンクを開きます")
-    return embed
-
-
 def _is_voice_notify_voice_channel(
     channel: object,
 ) -> TypeGuard[discord.VoiceChannel | discord.StageChannel]:
@@ -1030,12 +1009,6 @@ class VoiceCog(commands.Cog):
             event_type,
             invite_url=invite_url,
         )
-        embed = create_cross_guild_voice_notify_embed(
-            guild,
-            voice_channel,
-            event_type,
-            invite_url=invite_url,
-        )
         sent = False
         for config in receiver_configs:
             if config.notify_channel_id is None:
@@ -1049,7 +1022,6 @@ class VoiceCog(commands.Cog):
                     config.guild_id,
                     config.notify_channel_id,
                     content,
-                    embed,
                 ):
                     sent = True
                     continue
@@ -1068,24 +1040,16 @@ class VoiceCog(commands.Cog):
                 continue
 
             try:
-                if embed is None:
-                    await channel.send(
-                        content,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                else:
-                    await channel.send(
-                        content,
-                        embed=embed,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
+                await channel.send(
+                    content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 sent = True
             except discord.HTTPException as e:
                 if await self._send_cross_guild_voice_notification_via_rest(
                     config.guild_id,
                     config.notify_channel_id,
                     content,
-                    embed,
                 ):
                     sent = True
                     continue
@@ -1106,7 +1070,6 @@ class VoiceCog(commands.Cog):
         guild_id: str,
         channel_id: str,
         content: str,
-        embed: discord.Embed | None = None,
     ) -> bool:
         """Bot クライアントのキャッシュ経由で送れない場合に REST で送信する。"""
         from src.config import settings
@@ -1161,8 +1124,6 @@ class VoiceCog(commands.Cog):
                     "content": content,
                     "allowed_mentions": {"parse": []},
                 }
-                if embed is not None:
-                    payload["embeds"] = [embed.to_dict()]
                 try:
                     async with http.post(
                         message_url,
