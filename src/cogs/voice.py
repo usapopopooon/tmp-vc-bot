@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, TypeGuard
 from urllib.parse import urlparse
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -107,6 +108,7 @@ logger = logging.getLogger(__name__)
 
 _cross_guild_voice_notify_bots: weakref.WeakSet[commands.Bot] = weakref.WeakSet()
 _CROSS_GUILD_VOICE_NOTIFY_READY_WAIT_SECONDS = 5.0
+_DISCORD_API_BASE_URL = "https://discord.com/api/v10"
 
 
 def register_cross_guild_voice_notify_bot(bot: commands.Bot) -> None:
@@ -1020,6 +1022,14 @@ class VoiceCog(commands.Cog):
                 config.notify_channel_id,
             )
             if channel is None:
+                if await self._send_cross_guild_voice_notification_via_rest(
+                    config.guild_id,
+                    config.notify_channel_id,
+                    content,
+                ):
+                    sent = True
+                    continue
+
                 logger.warning(
                     "Cross-guild voice notify channel is not sendable: "
                     "source_guild=%s receiver_guild=%s notify=%s lookup=%s",
@@ -1040,6 +1050,14 @@ class VoiceCog(commands.Cog):
                 )
                 sent = True
             except discord.HTTPException as e:
+                if await self._send_cross_guild_voice_notification_via_rest(
+                    config.guild_id,
+                    config.notify_channel_id,
+                    content,
+                ):
+                    sent = True
+                    continue
+
                 logger.warning(
                     "Failed to send cross-guild voice notification: "
                     "source_guild=%s receiver_guild=%s notify=%s error=%s",
@@ -1050,6 +1068,97 @@ class VoiceCog(commands.Cog):
                 )
 
         return sent
+
+    async def _send_cross_guild_voice_notification_via_rest(
+        self,
+        guild_id: str,
+        channel_id: str,
+        content: str,
+    ) -> bool:
+        """Bot クライアントのキャッシュ経由で送れない場合に REST で送信する。"""
+        from src.config import settings
+
+        try:
+            guild_id_int = int(guild_id)
+        except ValueError:
+            return False
+
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as http:
+            for token_index, token in enumerate(settings.discord_tokens, start=1):
+                headers = {
+                    "Authorization": f"Bot {token}",
+                    "User-Agent": "tmp-vc-bot",
+                }
+                channel_url = f"{_DISCORD_API_BASE_URL}/channels/{channel_id}"
+                try:
+                    async with http.get(channel_url, headers=headers) as response:
+                        if response.status in {403, 404}:
+                            continue
+                        if response.status >= 400:
+                            body = await response.text()
+                            logger.warning(
+                                "Cross-guild REST channel lookup failed: "
+                                "receiver_guild=%s notify=%s token_index=%s "
+                                "status=%s body=%s",
+                                guild_id,
+                                channel_id,
+                                token_index,
+                                response.status,
+                                body[:200],
+                            )
+                            continue
+                        channel_payload = await response.json()
+                except aiohttp.ClientError as e:
+                    logger.warning(
+                        "Cross-guild REST channel lookup error: "
+                        "receiver_guild=%s notify=%s token_index=%s error=%s",
+                        guild_id,
+                        channel_id,
+                        token_index,
+                        e,
+                    )
+                    continue
+
+                if int(channel_payload.get("guild_id", 0)) != guild_id_int:
+                    continue
+
+                message_url = f"{channel_url}/messages"
+                try:
+                    async with http.post(
+                        message_url,
+                        headers=headers,
+                        json={
+                            "content": content,
+                            "allowed_mentions": {"parse": []},
+                        },
+                    ) as response:
+                        if 200 <= response.status < 300:
+                            return True
+                        if response.status in {403, 404}:
+                            continue
+                        body = await response.text()
+                        logger.warning(
+                            "Cross-guild REST send failed: "
+                            "receiver_guild=%s notify=%s token_index=%s "
+                            "status=%s body=%s",
+                            guild_id,
+                            channel_id,
+                            token_index,
+                            response.status,
+                            body[:200],
+                        )
+                except aiohttp.ClientError as e:
+                    logger.warning(
+                        "Cross-guild REST send error: "
+                        "receiver_guild=%s notify=%s token_index=%s error=%s",
+                        guild_id,
+                        channel_id,
+                        token_index,
+                        e,
+                    )
+
+        return False
 
     async def _fetch_cross_guild_voice_notify_channel(
         self,

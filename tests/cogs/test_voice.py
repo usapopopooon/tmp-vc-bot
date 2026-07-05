@@ -1729,6 +1729,60 @@ class TestVoiceNotify:
             "ほげ さんが [作業鯖](https://discord.gg/test) の 集中部屋 に入室しました。"
         )
 
+    async def test_send_cross_guild_voice_notification_uses_rest_fallback(
+        self,
+    ) -> None:
+        """送信先を取得できない場合は REST 送信にフォールバックする。"""
+        cog = _make_cog()
+        source_guild = MagicMock(spec=discord.Guild)
+        source_guild.id = 1000
+        source_guild.name = "作業鯖"
+        voice_channel = _make_channel(100)
+        voice_channel.name = "集中部屋"
+        member = _make_member(1)
+        member.display_name = "ほげ"
+
+        source_config = MagicMock()
+        source_config.share_enabled = True
+        source_config.invite_url = None
+        receiver_config = MagicMock()
+        receiver_config.guild_id = "2000"
+        receiver_config.notify_channel_id = "300"
+        mock_factory, _ = _mock_async_session()
+
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_voice_notify_cross_guild_config",
+                new_callable=AsyncMock,
+                return_value=source_config,
+            ),
+            patch(
+                "src.cogs.voice.list_voice_notify_cross_guild_receivers",
+                new_callable=AsyncMock,
+                return_value=[receiver_config],
+            ),
+        ):
+            cog._fetch_cross_guild_voice_notify_channel = AsyncMock(  # type: ignore[method-assign]
+                return_value=None
+            )
+            cog._send_cross_guild_voice_notification_via_rest = AsyncMock(  # type: ignore[method-assign]
+                return_value=True
+            )
+            sent = await cog._send_cross_guild_voice_notification(
+                source_guild,
+                member,
+                voice_channel,
+                "join",
+            )
+
+        assert sent is True
+        cog._send_cross_guild_voice_notification_via_rest.assert_awaited_once_with(
+            "2000",
+            "300",
+            "ほげ さんが 作業鯖 の 集中部屋 に入室しました。",
+        )
+
     async def test_fetch_cross_guild_voice_notify_channel_uses_registered_bot(
         self,
     ) -> None:
