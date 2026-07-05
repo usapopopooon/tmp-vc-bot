@@ -1655,8 +1655,7 @@ class TestVoiceNotify:
 
         assert embed.title is None
         assert embed.description == (
-            "ほげ さんが [作業鯖](https://discord.gg/test) の "
-            "集中部屋 に入室しました。"
+            "ほげ さんが [作業鯖](https://discord.gg/test) の 集中部屋 に入室しました。"
         )
         assert embed.url is None
 
@@ -1802,8 +1801,7 @@ class TestVoiceNotify:
         assert notify_channel.send.call_args.args == ()
         assert notify_channel.send.call_args.kwargs["embed"].title is None
         assert notify_channel.send.call_args.kwargs["embed"].description == (
-            "ほげ さんが [作業鯖](https://discord.gg/test) の "
-            "集中部屋 に入室しました。"
+            "ほげ さんが [作業鯖](https://discord.gg/test) の 集中部屋 に入室しました。"
         )
 
     async def test_send_cross_guild_voice_notification_uses_rest_fallback(
@@ -1871,8 +1869,7 @@ class TestVoiceNotify:
         )
         assert rest_kwargs["embed"].title is None
         assert rest_kwargs["embed"].description == (
-            "ほげ さんが [作業鯖](https://discord.gg/test) の "
-            "集中部屋 に入室しました。"
+            "ほげ さんが [作業鯖](https://discord.gg/test) の 集中部屋 に入室しました。"
         )
 
     async def test_fetch_cross_guild_voice_notify_channel_uses_registered_bot(

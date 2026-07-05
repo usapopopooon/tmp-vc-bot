@@ -291,8 +291,7 @@ class TestVoiceNotifyCrossGuildOperations:
 
         assert duplicate.id == exclude.id
         assert (
-            await is_voice_notify_cross_guild_excluded(db_session, "123", "456")
-            is True
+            await is_voice_notify_cross_guild_excluded(db_session, "123", "456") is True
         )
 
         excludes = await list_voice_notify_cross_guild_excludes(db_session, "123")
