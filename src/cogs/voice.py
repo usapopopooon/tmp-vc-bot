@@ -466,8 +466,8 @@ def _voice_notify_guild_label(label: str, _invite_url: str | None) -> str:
     """サーバー間通知本文に表示するサーバー名を返す。"""
     escaped_label = _escape_voice_notify_text(label)
     if _invite_url is not None:
-        return f"[{escaped_label}]({_invite_url})"
-    return escaped_label
+        return f"**[{escaped_label}]({_invite_url})**"
+    return f"**{escaped_label}**"
 
 
 def _is_discord_invite_url(value: str) -> bool:
