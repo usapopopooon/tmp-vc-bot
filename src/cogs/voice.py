@@ -149,9 +149,6 @@ VOICE_NOTIFY_STATUS_LIST_LIMIT = 20
 VOICE_NOTIFY_PERMISSION_ERROR_MESSAGE = (
     "そのチャンネルに送信または埋め込みリンク送信する権限が Bot にありません。"
 )
-VOICE_NOTIFY_CROSS_PERMISSION_ERROR_MESSAGE = (
-    "そのチャンネルに送信する権限が Bot にありません。"
-)
 
 VoiceNotifyEventType = Literal["join", "leave"]
 
@@ -440,9 +437,10 @@ def _escape_voice_notify_text(value: str) -> str:
 
 def _voice_notify_user_label(member: discord.Member, *, with_at: bool) -> str:
     """通知本文に表示するユーザー名ラベルを返す。"""
-    display_name = member.display_name
     if with_at:
-        display_name = f"@{display_name}"
+        return member.mention
+
+    display_name = member.display_name
     return _escape_voice_notify_text(display_name)
 
 
@@ -1102,7 +1100,7 @@ class VoiceCog(commands.Cog):
             if isinstance(source_config.invite_url, str) and source_config.invite_url
             else None
         )
-        message = create_cross_guild_voice_notify_message(
+        embed = create_cross_guild_voice_notify_embed(
             guild,
             member,
             voice_channel,
@@ -1121,7 +1119,7 @@ class VoiceCog(commands.Cog):
                 if await self._send_cross_guild_voice_notification_via_rest(
                     config.guild_id,
                     config.notify_channel_id,
-                    content=message,
+                    embed=embed,
                 ):
                     sent = True
                     continue
@@ -1141,7 +1139,7 @@ class VoiceCog(commands.Cog):
 
             try:
                 await channel.send(
-                    content=message,
+                    embed=embed,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 sent = True
@@ -1149,7 +1147,7 @@ class VoiceCog(commands.Cog):
                 if await self._send_cross_guild_voice_notification_via_rest(
                     config.guild_id,
                     config.notify_channel_id,
-                    content=message,
+                    embed=embed,
                 ):
                     sent = True
                     continue
@@ -1285,7 +1283,6 @@ class VoiceCog(commands.Cog):
             guild_channel = await self._fetch_voice_notify_sendable_channel(
                 guild,
                 channel_id,
-                require_embed_links=False,
             )
             if guild_channel is not None:
                 return guild_channel
@@ -1295,11 +1292,7 @@ class VoiceCog(commands.Cog):
             if (
                 _is_voice_notify_sendable_channel(channel)
                 and channel.guild.id == guild_id_int
-                and _can_bot_send_voice_notify_in_guild(
-                    channel,
-                    channel.guild,
-                    require_embed_links=False,
-                )
+                and _can_bot_send_voice_notify_in_guild(channel, channel.guild)
             ):
                 return channel
 
@@ -1312,11 +1305,7 @@ class VoiceCog(commands.Cog):
             if (
                 _is_voice_notify_sendable_channel(fetched)
                 and fetched.guild.id == guild_id_int
-                and _can_bot_send_voice_notify_in_guild(
-                    fetched,
-                    fetched.guild,
-                    require_embed_links=False,
-                )
+                and _can_bot_send_voice_notify_in_guild(fetched, fetched.guild)
             ):
                 return fetched
         return None
@@ -2778,13 +2767,9 @@ class VoiceCog(commands.Cog):
         """他サーバーから共有された VC 入退室通知の受信先を設定する。"""
         if not await self._ensure_voice_notify_guild(interaction):
             return
-        if not _can_bot_send_voice_notify(
-            notify,
-            interaction,
-            require_embed_links=False,
-        ):
+        if not _can_bot_send_voice_notify(notify, interaction):
             await interaction.response.send_message(
-                VOICE_NOTIFY_CROSS_PERMISSION_ERROR_MESSAGE,
+                VOICE_NOTIFY_PERMISSION_ERROR_MESSAGE,
                 ephemeral=True,
             )
             return
