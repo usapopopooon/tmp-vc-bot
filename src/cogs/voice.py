@@ -149,6 +149,9 @@ VOICE_NOTIFY_STATUS_LIST_LIMIT = 20
 VOICE_NOTIFY_PERMISSION_ERROR_MESSAGE = (
     "そのチャンネルに送信または埋め込みリンク送信する権限が Bot にありません。"
 )
+VOICE_NOTIFY_CROSS_PERMISSION_ERROR_MESSAGE = (
+    "そのチャンネルに送信する権限が Bot にありません。"
+)
 
 VoiceNotifyEventType = Literal["join", "leave"]
 
@@ -430,13 +433,26 @@ def _dialog_room_prefix(lobby_name: str, room_prefix: str | None) -> str:
     return _DIALOG_DEFAULT_ROOM_PREFIX
 
 
+def _escape_voice_notify_text(value: str) -> str:
+    """通知本文に埋め込むプレーンテキストをエスケープする。"""
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(value))
+
+
+def _voice_notify_user_label(member: discord.Member, *, with_at: bool) -> str:
+    """通知本文に表示するユーザー名ラベルを返す。"""
+    display_name = member.display_name
+    if with_at:
+        display_name = f"@{display_name}"
+    return _escape_voice_notify_text(display_name)
+
+
 def create_voice_notify_message(
     member: discord.Member,
     voice_channel_id: int | str,
     event_type: VoiceNotifyEventType,
 ) -> str:
     """VC 入退室通知の本文を作成する。"""
-    display_name = discord.utils.escape_markdown(member.display_name)
+    display_name = _voice_notify_user_label(member, with_at=True)
     if event_type == "join":
         return f"{display_name} さんが <#{voice_channel_id}> に入室しました。"
     return f"{display_name} さんが <#{voice_channel_id}> から退室しました。"
@@ -455,11 +471,6 @@ def create_voice_notify_embed(
             event_type,
         )
     )
-
-
-def _escape_voice_notify_text(value: str) -> str:
-    """通知本文に埋め込むプレーンテキストをエスケープする。"""
-    return discord.utils.escape_markdown(discord.utils.escape_mentions(value))
 
 
 def _voice_notify_guild_label(label: str, _invite_url: str | None) -> str:
@@ -495,7 +506,7 @@ def create_cross_guild_voice_notify_message(
     """サーバー間 VC 入退室通知の本文を作成する。"""
     guild_name = _voice_notify_guild_label(guild.name, invite_url)
     channel_name = _escape_voice_notify_text(voice_channel.name)
-    display_name = _escape_voice_notify_text(member.display_name)
+    display_name = _voice_notify_user_label(member, with_at=False)
     if event_type == "join":
         return f"{display_name} さんが {guild_name} の {channel_name} に入室しました。"
     return f"{display_name} さんが {guild_name} の {channel_name} から退室しました。"
@@ -558,6 +569,8 @@ def _format_limited_voice_notify_lines(lines: list[str]) -> list[str]:
 def _can_bot_send_voice_notify(
     channel: discord.TextChannel,
     interaction: discord.Interaction,
+    *,
+    require_embed_links: bool = True,
 ) -> bool:
     """指定チャンネルへ Bot が通知を送れるかを確認する。"""
     guild = interaction.guild
@@ -567,7 +580,12 @@ def _can_bot_send_voice_notify(
     bot_user_id = (
         interaction.client.user.id if interaction.client.user is not None else None
     )
-    return _can_bot_send_voice_notify_in_guild(channel, guild, bot_user_id=bot_user_id)
+    return _can_bot_send_voice_notify_in_guild(
+        channel,
+        guild,
+        bot_user_id=bot_user_id,
+        require_embed_links=require_embed_links,
+    )
 
 
 def _can_bot_send_voice_notify_in_guild(
@@ -575,8 +593,9 @@ def _can_bot_send_voice_notify_in_guild(
     guild: discord.Guild,
     *,
     bot_user_id: int | None = None,
+    require_embed_links: bool = True,
 ) -> bool:
-    """指定チャンネルへ Bot が Embed 通知を送れるかを確認する。"""
+    """指定チャンネルへ Bot が通知を送れるかを確認する。"""
     bot_member = guild.me
     if bot_member is None and bot_user_id is not None:
         bot_member = guild.get_member(bot_user_id)
@@ -584,11 +603,9 @@ def _can_bot_send_voice_notify_in_guild(
         return True
 
     permissions = channel.permissions_for(bot_member)
-    return (
-        permissions.view_channel
-        and permissions.send_messages
-        and permissions.embed_links
-    )
+    if not permissions.view_channel or not permissions.send_messages:
+        return False
+    return permissions.embed_links if require_embed_links else True
 
 
 class VoiceCog(commands.Cog):
@@ -1012,6 +1029,8 @@ class VoiceCog(commands.Cog):
         self,
         guild: discord.Guild,
         channel_id: str,
+        *,
+        require_embed_links: bool = True,
     ) -> discord.TextChannel | None:
         """通知送信可能なテキストチャンネルを取得する。"""
         try:
@@ -1021,7 +1040,11 @@ class VoiceCog(commands.Cog):
 
         channel = guild.get_channel(channel_id_int)
         if _is_voice_notify_sendable_channel(channel):
-            if _can_bot_send_voice_notify_in_guild(channel, guild):
+            if _can_bot_send_voice_notify_in_guild(
+                channel,
+                guild,
+                require_embed_links=require_embed_links,
+            ):
                 return channel
             return None
 
@@ -1032,7 +1055,11 @@ class VoiceCog(commands.Cog):
 
         if _is_voice_notify_sendable_channel(
             fetched
-        ) and _can_bot_send_voice_notify_in_guild(fetched, guild):
+        ) and _can_bot_send_voice_notify_in_guild(
+            fetched,
+            guild,
+            require_embed_links=require_embed_links,
+        ):
             return fetched
         return None
 
@@ -1075,7 +1102,7 @@ class VoiceCog(commands.Cog):
             if isinstance(source_config.invite_url, str) and source_config.invite_url
             else None
         )
-        embed = create_cross_guild_voice_notify_embed(
+        message = create_cross_guild_voice_notify_message(
             guild,
             member,
             voice_channel,
@@ -1094,7 +1121,7 @@ class VoiceCog(commands.Cog):
                 if await self._send_cross_guild_voice_notification_via_rest(
                     config.guild_id,
                     config.notify_channel_id,
-                    embed=embed,
+                    content=message,
                 ):
                     sent = True
                     continue
@@ -1114,7 +1141,7 @@ class VoiceCog(commands.Cog):
 
             try:
                 await channel.send(
-                    embed=embed,
+                    content=message,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 sent = True
@@ -1122,7 +1149,7 @@ class VoiceCog(commands.Cog):
                 if await self._send_cross_guild_voice_notification_via_rest(
                     config.guild_id,
                     config.notify_channel_id,
-                    embed=embed,
+                    content=message,
                 ):
                     sent = True
                     continue
@@ -1258,6 +1285,7 @@ class VoiceCog(commands.Cog):
             guild_channel = await self._fetch_voice_notify_sendable_channel(
                 guild,
                 channel_id,
+                require_embed_links=False,
             )
             if guild_channel is not None:
                 return guild_channel
@@ -1267,7 +1295,11 @@ class VoiceCog(commands.Cog):
             if (
                 _is_voice_notify_sendable_channel(channel)
                 and channel.guild.id == guild_id_int
-                and _can_bot_send_voice_notify_in_guild(channel, channel.guild)
+                and _can_bot_send_voice_notify_in_guild(
+                    channel,
+                    channel.guild,
+                    require_embed_links=False,
+                )
             ):
                 return channel
 
@@ -1280,7 +1312,11 @@ class VoiceCog(commands.Cog):
             if (
                 _is_voice_notify_sendable_channel(fetched)
                 and fetched.guild.id == guild_id_int
-                and _can_bot_send_voice_notify_in_guild(fetched, fetched.guild)
+                and _can_bot_send_voice_notify_in_guild(
+                    fetched,
+                    fetched.guild,
+                    require_embed_links=False,
+                )
             ):
                 return fetched
         return None
@@ -2742,9 +2778,13 @@ class VoiceCog(commands.Cog):
         """他サーバーから共有された VC 入退室通知の受信先を設定する。"""
         if not await self._ensure_voice_notify_guild(interaction):
             return
-        if not _can_bot_send_voice_notify(notify, interaction):
+        if not _can_bot_send_voice_notify(
+            notify,
+            interaction,
+            require_embed_links=False,
+        ):
             await interaction.response.send_message(
-                VOICE_NOTIFY_PERMISSION_ERROR_MESSAGE,
+                VOICE_NOTIFY_CROSS_PERMISSION_ERROR_MESSAGE,
                 ephemeral=True,
             )
             return

@@ -1530,7 +1530,7 @@ class TestVoiceNotify:
 
         message = create_voice_notify_message(member, "100", "join")
 
-        assert message == r"\*ほげ\* さんが <#100> に入室しました。"
+        assert message == r"@\*ほげ\* さんが <#100> に入室しました。"
 
     def test_create_voice_notify_embed_uses_description(self) -> None:
         """通常通知 Embed は本文に通知メッセージを入れる。"""
@@ -1540,7 +1540,7 @@ class TestVoiceNotify:
         embed = create_voice_notify_embed(member, "100", "join")
 
         assert embed.title is None
-        assert embed.description == "ほげ さんが <#100> に入室しました。"
+        assert embed.description == "@ほげ さんが <#100> に入室しました。"
         assert embed.url is None
 
     def test_can_bot_send_voice_notify_requires_embed_links(self) -> None:
@@ -1861,8 +1861,8 @@ class TestVoiceNotify:
         )
         notify_channel.send.assert_awaited_once()
         assert notify_channel.send.call_args.args == ()
-        assert notify_channel.send.call_args.kwargs["embed"].title is None
-        assert notify_channel.send.call_args.kwargs["embed"].description == (
+        assert "embed" not in notify_channel.send.call_args.kwargs
+        assert notify_channel.send.call_args.kwargs["content"] == (
             "ほげ さんが **[作業鯖](https://discord.gg/test)** の "
             "集中部屋 に入室しました。"
         )
@@ -1930,8 +1930,8 @@ class TestVoiceNotify:
             "2000",
             "300",
         )
-        assert rest_kwargs["embed"].title is None
-        assert rest_kwargs["embed"].description == (
+        assert "embed" not in rest_kwargs
+        assert rest_kwargs["content"] == (
             "ほげ さんが **[作業鯖](https://discord.gg/test)** の "
             "集中部屋 に入室しました。"
         )
@@ -1959,10 +1959,10 @@ class TestVoiceNotify:
         cog.bot.get_guild.assert_called_once_with(2000)
         receiver_bot.get_guild.assert_called_once_with(2000)
 
-    async def test_fetch_cross_guild_voice_notify_channel_requires_embed_links(
+    async def test_fetch_cross_guild_voice_notify_channel_allows_without_embed_links(
         self,
     ) -> None:
-        """クロス通知先探索でも Embed 送信権限を確認する。"""
+        """クロス通知先探索では通常メッセージの送信権限だけ確認する。"""
         cog = _make_cog()
         cog.bot.get_guild = MagicMock(return_value=None)
         receiver_guild = MagicMock(spec=discord.Guild)
@@ -1985,9 +1985,9 @@ class TestVoiceNotify:
 
         channel = await cog._fetch_cross_guild_voice_notify_channel("2000", "300")
 
-        assert channel is None
+        assert channel is notify_channel
         notify_channel.permissions_for.assert_called_once_with(bot_member)
-        cog.bot.fetch_channel.assert_awaited_once_with(300)
+        cog.bot.fetch_channel.assert_not_awaited()
 
     async def test_send_voice_notification_deduplicates_direct_and_category(
         self,
@@ -2044,7 +2044,7 @@ class TestVoiceNotify:
         assert notify_channel.send.call_args.args == ()
         assert notify_channel.send.call_args.kwargs["embed"].title is None
         assert notify_channel.send.call_args.kwargs["embed"].description == (
-            "ほげほげ さんが <#100> に入室しました。"
+            "@ほげほげ さんが <#100> に入室しました。"
         )
 
     async def test_send_voice_notification_skips_excluded_category(self) -> None:
