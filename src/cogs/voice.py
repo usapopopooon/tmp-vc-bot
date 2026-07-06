@@ -2674,8 +2674,7 @@ class VoiceCog(commands.Cog):
         content = (
             f"通知除外VCを解除しました。除外VC: <#{voice.id}>"
             if removed
-            else "そのVCは通知除外対象に設定されていません。"
-            f"除外VC: <#{voice.id}>"
+            else f"そのVCは通知除外対象に設定されていません。除外VC: <#{voice.id}>"
         )
         await interaction.response.send_message(content, ephemeral=True)
 
