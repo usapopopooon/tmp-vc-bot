@@ -1798,6 +1798,53 @@ class TestVoiceNotify:
         mock_is_excluded.assert_awaited_once_with(mock_session, "1000", "100")
         mock_list_receivers.assert_not_awaited()
 
+    async def test_send_cross_guild_voice_notification_skips_regular_excluded_voice(
+        self,
+    ) -> None:
+        """通常通知の除外 VC もサーバー間通知へ流さない。"""
+        cog = _make_cog()
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 1000
+        voice_channel = _make_channel(100)
+        member = _make_member(1)
+        source_config = MagicMock()
+        source_config.share_enabled = True
+        mock_factory, mock_session = _mock_async_session()
+
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_voice_notify_cross_guild_config",
+                new_callable=AsyncMock,
+                return_value=source_config,
+            ),
+            patch(
+                "src.cogs.voice.is_voice_notify_cross_guild_excluded",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as mock_is_cross_excluded,
+            patch(
+                "src.cogs.voice.is_voice_notify_excluded",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_is_regular_excluded,
+            patch(
+                "src.cogs.voice.list_voice_notify_cross_guild_receivers",
+                new_callable=AsyncMock,
+            ) as mock_list_receivers,
+        ):
+            sent = await cog._send_cross_guild_voice_notification(
+                guild,
+                member,
+                voice_channel,
+                "join",
+            )
+
+        assert sent is False
+        mock_is_cross_excluded.assert_awaited_once_with(mock_session, "1000", "100")
+        mock_is_regular_excluded.assert_awaited_once_with(mock_session, "1000", "100")
+        mock_list_receivers.assert_not_awaited()
+
     async def test_send_cross_guild_voice_notification_sends_to_receivers(
         self,
     ) -> None:
@@ -1832,7 +1879,12 @@ class TestVoiceNotify:
                 "src.cogs.voice.is_voice_notify_cross_guild_excluded",
                 new_callable=AsyncMock,
                 return_value=False,
-            ) as mock_is_excluded,
+            ) as mock_is_cross_excluded,
+            patch(
+                "src.cogs.voice.is_voice_notify_excluded",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as mock_is_regular_excluded,
             patch(
                 "src.cogs.voice.list_voice_notify_cross_guild_receivers",
                 new_callable=AsyncMock,
@@ -1850,7 +1902,8 @@ class TestVoiceNotify:
             )
 
         assert sent is True
-        mock_is_excluded.assert_awaited_once_with(mock_session, "1000", "100")
+        mock_is_cross_excluded.assert_awaited_once_with(mock_session, "1000", "100")
+        mock_is_regular_excluded.assert_awaited_once_with(mock_session, "1000", "100")
         mock_list_receivers.assert_awaited_once_with(
             mock_session,
             exclude_guild_id="1000",
@@ -1900,7 +1953,12 @@ class TestVoiceNotify:
                 "src.cogs.voice.is_voice_notify_cross_guild_excluded",
                 new_callable=AsyncMock,
                 return_value=False,
-            ) as mock_is_excluded,
+            ) as mock_is_cross_excluded,
+            patch(
+                "src.cogs.voice.is_voice_notify_excluded",
+                new_callable=AsyncMock,
+                return_value=False,
+            ) as mock_is_regular_excluded,
             patch(
                 "src.cogs.voice.list_voice_notify_cross_guild_receivers",
                 new_callable=AsyncMock,
@@ -1921,7 +1979,8 @@ class TestVoiceNotify:
             )
 
         assert sent is True
-        mock_is_excluded.assert_awaited_once_with(mock_session, "1000", "100")
+        mock_is_cross_excluded.assert_awaited_once_with(mock_session, "1000", "100")
+        mock_is_regular_excluded.assert_awaited_once_with(mock_session, "1000", "100")
         cog._send_cross_guild_voice_notification_via_rest.assert_awaited_once()
         rest_args = cog._send_cross_guild_voice_notification_via_rest.await_args.args
         rest_kwargs = (

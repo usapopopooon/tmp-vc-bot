@@ -1086,6 +1086,12 @@ class VoiceCog(commands.Cog):
                 voice_channel_id,
             ):
                 return False
+            if await is_voice_notify_excluded(
+                session,
+                guild_id,
+                voice_channel_id,
+            ):
+                return False
 
             receiver_configs = await list_voice_notify_cross_guild_receivers(
                 session,
@@ -2625,14 +2631,14 @@ class VoiceCog(commands.Cog):
 
     @voice_notify_group.command(
         name="exclude-add",
-        description="カテゴリ通知から除外するVCを追加します",
+        description="カテゴリ通知とサーバー間通知から除外するVCを追加します",
     )
     async def voice_notify_exclude_add(
         self,
         interaction: discord.Interaction,
         voice: discord.VoiceChannel | discord.StageChannel,
     ) -> None:
-        """カテゴリ通知の除外 VC を追加する。"""
+        """カテゴリ通知とサーバー間通知の除外 VC を追加する。"""
         if not await self._ensure_voice_notify_guild(interaction):
             return
 
@@ -2641,20 +2647,20 @@ class VoiceCog(commands.Cog):
             await add_voice_notify_exclude(session, guild_id, str(voice.id))
 
         await interaction.response.send_message(
-            f"カテゴリ通知の除外VCに追加しました。除外VC: <#{voice.id}>",
+            f"通知除外VCに追加しました。除外VC: <#{voice.id}>",
             ephemeral=True,
         )
 
     @voice_notify_group.command(
         name="exclude-remove",
-        description="カテゴリ通知の除外VCを解除します",
+        description="カテゴリ通知とサーバー間通知の除外VCを解除します",
     )
     async def voice_notify_exclude_remove(
         self,
         interaction: discord.Interaction,
         voice: discord.VoiceChannel | discord.StageChannel,
     ) -> None:
-        """カテゴリ通知の除外 VC を削除する。"""
+        """カテゴリ通知とサーバー間通知の除外 VC を削除する。"""
         if not await self._ensure_voice_notify_guild(interaction):
             return
 
@@ -2666,9 +2672,9 @@ class VoiceCog(commands.Cog):
             )
 
         content = (
-            f"カテゴリ通知の除外VCを解除しました。除外VC: <#{voice.id}>"
+            f"通知除外VCを解除しました。除外VC: <#{voice.id}>"
             if removed
-            else "そのVCはカテゴリ通知の除外対象に設定されていません。"
+            else "そのVCは通知除外対象に設定されていません。"
             f"除外VC: <#{voice.id}>"
         )
         await interaction.response.send_message(content, ephemeral=True)
@@ -2725,7 +2731,7 @@ class VoiceCog(commands.Cog):
         if category_lines:
             lines.extend(["カテゴリ:", *category_lines])
         if exclude_lines:
-            lines.extend(["カテゴリ通知の除外VC:", *exclude_lines])
+            lines.extend(["通知除外VC:", *exclude_lines])
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
