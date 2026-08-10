@@ -14,6 +14,7 @@ from src.cogs.voice import (
     VC_CREATE_COOLDOWN_SECONDS,
     NumberedLobbyModal,
     VoiceCog,
+    VoiceNotifyEventType,
     _can_bot_send_voice_notify,
     _cleanup_vc_create_cooldown_cache,
     _vc_create_cooldown_cache,
@@ -1543,6 +1544,23 @@ class TestVoiceNotify:
         assert embed.description == "<@1> さんが <#100> に入室しました。"
         assert embed.url is None
 
+    @pytest.mark.parametrize(
+        ("event_type", "expected_color"),
+        [("join", 0x78A88D), ("leave", 0xC17C7C)],
+    )
+    def test_voice_notify_embed_color_matches_event(
+        self,
+        event_type: VoiceNotifyEventType,
+        expected_color: int,
+    ) -> None:
+        """通常通知は入室と退室を落ち着いた色で区別する。"""
+        member = _make_member(1)
+
+        embed = create_voice_notify_embed(member, "100", event_type)
+
+        assert embed.color is not None
+        assert embed.color.value == expected_color
+
     def test_can_bot_send_voice_notify_requires_embed_links(self) -> None:
         """通知先設定では Embed 送信権限も必要とする。"""
         guild = MagicMock(spec=discord.Guild)
@@ -1697,6 +1715,32 @@ class TestVoiceNotify:
             "集中部屋 に入室しました。"
         )
         assert embed.url is None
+
+    @pytest.mark.parametrize(
+        ("event_type", "expected_color"),
+        [("join", 0x78A88D), ("leave", 0xC17C7C)],
+    )
+    def test_cross_guild_voice_notify_embed_color_matches_event(
+        self,
+        event_type: VoiceNotifyEventType,
+        expected_color: int,
+    ) -> None:
+        """サーバー間通知も通常通知と同じ入退室色を使う。"""
+        guild = MagicMock(spec=discord.Guild)
+        guild.name = "作業鯖"
+        voice_channel = _make_channel(100)
+        voice_channel.name = "集中部屋"
+        member = _make_member(1)
+
+        embed = create_cross_guild_voice_notify_embed(
+            guild,
+            member,
+            voice_channel,
+            event_type,
+        )
+
+        assert embed.color is not None
+        assert embed.color.value == expected_color
 
     async def test_fetch_voice_notify_channel_requires_embed_links(self) -> None:
         """既存設定の通知先取得でも Embed 送信権限を確認する。"""

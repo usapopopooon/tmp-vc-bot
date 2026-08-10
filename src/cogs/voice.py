@@ -108,6 +108,11 @@ DEFAULT_RTC_REGION = "japan"
 # VC 作成のクールダウン時間 (秒)
 VC_CREATE_COOLDOWN_SECONDS = 30
 
+# VC 入退室通知の Embed 色。Discord の暗い背景でも刺激が強く
+# なりすぎないよう、入室はセージ、退室はくすんだローズにする。
+_VOICE_NOTIFY_JOIN_COLOR = 0x78A88D
+_VOICE_NOTIFY_LEAVE_COLOR = 0xC17C7C
+
 logger = logging.getLogger(__name__)
 
 _cross_guild_voice_notify_bots: weakref.WeakSet[commands.Bot] = weakref.WeakSet()
@@ -467,7 +472,12 @@ def create_voice_notify_embed(
             member,
             voice_channel_id,
             event_type,
-        )
+        ),
+        color=(
+            _VOICE_NOTIFY_JOIN_COLOR
+            if event_type == "join"
+            else _VOICE_NOTIFY_LEAVE_COLOR
+        ),
     )
 
 
@@ -525,7 +535,12 @@ def create_cross_guild_voice_notify_embed(
             voice_channel,
             event_type,
             invite_url=invite_url,
-        )
+        ),
+        color=(
+            _VOICE_NOTIFY_JOIN_COLOR
+            if event_type == "join"
+            else _VOICE_NOTIFY_LEAVE_COLOR
+        ),
     )
 
 
