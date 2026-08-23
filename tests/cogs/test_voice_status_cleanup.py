@@ -370,7 +370,7 @@ class TestVoiceStatusCleanupCommands:
             replace=True,
         )
         message = interaction.response.send_message.call_args.args[0]
-        assert "0人になってから5分後" in message
+        assert "0人になってから1分後" in message
 
     async def test_remove_deletes_config_and_cancels_category_tasks(self) -> None:
         cog = _make_cog()

@@ -75,10 +75,10 @@ bot 自体は 1 プロセスで全サーバーを捌くので、**インスト�
 
 ### 空室 VC のステータス自動除去
 
-管理者がカテゴリごとに設定する。待ち時間は 1〜1440 分で、省略時は 5 分。
+管理者がカテゴリごとに設定する。待ち時間は 1〜1440 分で、省略時は 1 分。
 
 ```text
-/voice-status-cleanup add category:<カテゴリ> delay_minutes:5
+/voice-status-cleanup add category:<カテゴリ> delay_minutes:1
 /voice-status-cleanup remove category:<カテゴリ>
 /voice-status-cleanup status
 ```
