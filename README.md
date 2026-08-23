@@ -26,6 +26,8 @@ Discord の **一時ボイスチャンネル (Ephemeral VC) 機能だけ** を�
   受信先設定済みの他サーバーへ通知。サーバー名リンクには管理者が設定した固定招待 URL を使う。
   通常通知の除外 VC はクロス通知でも送らず、クロス通知だけの除外 VC は
   `/voice-notify-cross exclude-add` / `exclude-remove` で別管理
+- `/voice-status-cleanup` — カテゴリごとに、VC が 0 人になってから指定時間後に
+  ボイスチャンネルステータスを自動除去。待機中に再入室した場合は除去を中止
 - マルチインスタンス対応 (`processed_events` テーブルでアトミック重複排除)
 - Bot 再起動後もコントロールパネルのボタンが動作 (永続 View)
 
@@ -71,6 +73,20 @@ make test-db-stop                     # テスト用 PostgreSQL を停止
 bot 自体は 1 プロセスで全サーバーを捌くので、**インストール先のサーバーを増やすだけ** で
 追加運用ができます (再デプロイ不要)。
 
+### 空室 VC のステータス自動除去
+
+管理者がカテゴリごとに設定する。待ち時間は 1〜1440 分で、省略時は 5 分。
+
+```text
+/voice-status-cleanup add category:<カテゴリ> delay_minutes:5
+/voice-status-cleanup remove category:<カテゴリ>
+/voice-status-cleanup status
+```
+
+対象カテゴリ内の通常 VC が 0 人になると待機を開始し、待機中に誰かが入室した場合は
+キャンセルする。Bot は空の VC に接続していないため、Discord の仕様上
+`Set Voice Channel Status` と `Manage Channels` の両方の権限が必要。
+
 ### 複数 Bot アカウント運用
 
 `DISCORD_TOKEN` は従来どおり単一 Bot 用として使える。複数の Bot アカウントを
@@ -90,7 +106,8 @@ Discord Developer Portal → OAuth2 → URL Generator で以下を選択:
 
 - **Scopes**: `bot`, `applications.commands` (両方必須)
 - **Bot Permissions**: `Manage Channels`, `Move Members`, `Connect`, `Speak`,
-  `Send Messages`, `Embed Links`, `Manage Messages` (パネルのピン留めに必要)
+  `Send Messages`, `Embed Links`, `Manage Messages` (パネルのピン留めに必要),
+  `Set Voice Channel Status`
 
 生成された URL を各サーバー管理者に共有すれば、それぞれのサーバーに追加できます。
 

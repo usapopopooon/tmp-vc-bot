@@ -6,6 +6,7 @@
     - lobbies: ロビーVC の設定 (どのチャンネルがロビーか)
     - voice_sessions: 現在アクティブな一時 VC のセッション情報
     - voice_session_members: 一時 VC の参加メンバー
+    - voice_status_cleanup_configs: カテゴリ別の空室ステータス除去設定
     - processed_events: マルチインスタンス重複排除テーブル
 """
 
@@ -13,6 +14,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -388,6 +390,55 @@ class VoiceNotifyCrossGuildExclude(Base):
         return (
             f"<VoiceNotifyCrossGuildExclude(id={self.id}, "
             f"guild_id={self.guild_id}, voice_channel_id={self.voice_channel_id})>"
+        )
+
+
+class VoiceStatusCleanupConfig(Base):
+    """カテゴリ別の空室時ボイスチャンネルステータス除去設定。"""
+
+    __tablename__ = "voice_status_cleanup_configs"
+    __table_args__ = (
+        UniqueConstraint(
+            "guild_id",
+            "category_id",
+            name="uq_voice_status_cleanup_guild_category",
+        ),
+        CheckConstraint(
+            "delay_seconds BETWEEN 60 AND 86400",
+            name="ck_voice_status_cleanup_delay_seconds",
+        ),
+        Index("ix_voice_status_cleanup_configs_guild_id", "guild_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    guild_id: Mapped[str] = mapped_column(String, nullable=False)
+    category_id: Mapped[str] = mapped_column(String, nullable=False)
+    delay_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=300)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    @validates("guild_id", "category_id")
+    def _validate_ids(self, key: str, value: str) -> str:
+        return _validate_discord_id(value, key)
+
+    @validates("delay_seconds")
+    def _validate_delay_seconds(self, _key: str, value: int) -> int:
+        if not isinstance(value, int) or not 60 <= value <= 86400:
+            msg = f"delay_seconds must be between 60 and 86400, got: {value!r}"
+            raise ValueError(msg)
+        return value
+
+    def __repr__(self) -> str:
+        return (
+            f"<VoiceStatusCleanupConfig(id={self.id}, guild_id={self.guild_id}, "
+            f"category_id={self.category_id}, delay_seconds={self.delay_seconds})>"
         )
 
 

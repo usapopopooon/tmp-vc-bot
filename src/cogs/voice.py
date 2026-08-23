@@ -71,6 +71,7 @@ from src.services.db_service import (
     delete_voice_notify_exclude,
     delete_voice_session,
     delete_voice_sessions_by_guild,
+    delete_voice_status_cleanup_config,
     get_all_lobbies,
     get_lobbies_by_guild,
     get_lobby_by_channel_id,
@@ -79,6 +80,7 @@ from src.services.db_service import (
     get_voice_session,
     get_voice_session_members_ordered,
     get_voice_sessions_by_lobby,
+    get_voice_status_cleanup_config,
     is_voice_notify_cross_guild_excluded,
     is_voice_notify_excluded,
     list_voice_notify_category_configs,
@@ -87,12 +89,14 @@ from src.services.db_service import (
     list_voice_notify_cross_guild_excludes,
     list_voice_notify_cross_guild_receivers,
     list_voice_notify_excludes,
+    list_voice_status_cleanup_configs,
     remove_voice_session_member,
     set_voice_notify_category_config,
     set_voice_notify_config,
     set_voice_notify_cross_guild_channel,
     set_voice_notify_cross_guild_invite_url,
     set_voice_notify_cross_guild_share,
+    set_voice_status_cleanup_config,
     update_voice_session,
 )
 from src.ui.control_panel import (
@@ -154,6 +158,9 @@ VOICE_NOTIFY_STATUS_LIST_LIMIT = 20
 VOICE_NOTIFY_PERMISSION_ERROR_MESSAGE = (
     "そのチャンネルに送信または埋め込みリンク送信する権限が Bot にありません。"
 )
+VOICE_STATUS_CLEANUP_DEFAULT_DELAY_MINUTES = 5
+VOICE_STATUS_CLEANUP_MAX_DELAY_MINUTES = 1440
+_SET_VOICE_CHANNEL_STATUS_PERMISSION = 1 << 48
 
 VoiceNotifyEventType = Literal["join", "leave"]
 
@@ -173,6 +180,15 @@ class LobbyCreateConfig:
     feature_preset: str
     default_user_limit: int
     feature_overrides: dict[str, bool | None]
+
+
+@dataclass(frozen=True)
+class _PendingVoiceStatusCleanup:
+    """実行待ちのボイスチャンネルステータス除去タスク。"""
+
+    task: asyncio.Task[None]
+    guild_id: int
+    category_id: int
 
 
 # ==========================================================================
@@ -570,6 +586,32 @@ def _voice_notify_category_id(channel: object) -> str | None:
     return None
 
 
+def _format_voice_status_cleanup_delay(delay_seconds: int) -> str:
+    """ステータス除去までの待ち時間を表示用に整形する。"""
+    return f"{delay_seconds // 60}分"
+
+
+def _can_clear_voice_channel_status(
+    channel: discord.VoiceChannel,
+    *,
+    bot_user_id: int | None,
+) -> bool:
+    """空の VC のステータスを除去できる権限があるか判定する。"""
+    bot_member = channel.guild.me
+    if bot_member is None and bot_user_id is not None:
+        bot_member = channel.guild.get_member(bot_user_id)
+    if bot_member is None:
+        return False
+
+    permissions = channel.permissions_for(bot_member)
+    if permissions.administrator:
+        return True
+    return bool(
+        permissions.manage_channels
+        and permissions.value & _SET_VOICE_CHANNEL_STATUS_PERMISSION
+    )
+
+
 def _format_limited_voice_notify_lines(lines: list[str]) -> list[str]:
     """status 表示の件数を制限する。"""
     limited = lines[:VOICE_NOTIFY_STATUS_LIST_LIMIT]
@@ -642,9 +684,14 @@ class VoiceCog(commands.Cog):
         # ロビーチャンネル ID のインメモリキャッシュ
         # None = 未ロード (フォールスルー), set = ロード済み (キャッシュ使用)
         self._lobby_channel_ids: set[str] | None = None
+        # 空室になった VC のステータス除去待機タスク
+        self._voice_status_cleanup_tasks: dict[int, _PendingVoiceStatusCleanup] = {}
 
     async def cog_unload(self) -> None:
         """Cog アンロード時にクロス通知用 Bot レジストリから解除する。"""
+        for pending in self._voice_status_cleanup_tasks.values():
+            pending.task.cancel()
+        self._voice_status_cleanup_tasks.clear()
         unregister_cross_guild_voice_notify_bot(self.bot)
 
     def _iter_cross_guild_voice_notify_bots(self) -> list[commands.Bot]:
@@ -770,6 +817,10 @@ class VoiceCog(commands.Cog):
             guild_ids,
             len(_cross_guild_voice_notify_bots),
         )
+        try:
+            await self._restore_voice_status_cleanup_tasks()
+        except Exception:
+            logger.exception("Failed to restore voice status cleanup tasks")
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -793,6 +844,13 @@ class VoiceCog(commands.Cog):
             after: 変更後の状態 (after.channel = 今いるチャンネル)
         """
         if before.channel != after.channel:
+            try:
+                await self._handle_voice_status_cleanup_state_update(before, after)
+            except Exception:
+                logger.exception(
+                    "Failed to handle voice status cleanup: member=%s",
+                    member.id,
+                )
             try:
                 await self._handle_voice_notify_state_update(member, before, after)
             except Exception:
@@ -846,10 +904,14 @@ class VoiceCog(commands.Cog):
                 str(channel.guild.id),
                 channel_id_str,
             )
+        if isinstance(channel, discord.CategoryChannel):
+            self._cancel_voice_status_cleanup_for_category(channel.id)
+            return
 
         if not isinstance(channel, discord.VoiceChannel):
             return
 
+        self._cancel_voice_status_cleanup(channel.id)
         # メモリキャッシュの参加記録を削除
         self._cleanup_channel_cache(channel.id)
         # DB のレコードをクリーンアップ (存在しなくても安全)
@@ -878,9 +940,10 @@ class VoiceCog(commands.Cog):
             # 次にロビーを削除
             lobby_count = await delete_lobbies_by_guild(session, guild_id)
 
+        self._cancel_voice_status_cleanup_for_guild(guild.id)
         if notify_count > 0 or vs_count > 0 or lobby_count > 0:
             logger.info(
-                "Cleaned up %d voice notify setting(s), %d voice session(s), "
+                "Cleaned up %d voice setting(s), %d voice session(s), "
                 "and %d lobby/lobbies "
                 "for removed guild: guild=%s",
                 notify_count,
@@ -888,6 +951,209 @@ class VoiceCog(commands.Cog):
                 lobby_count,
                 guild_id,
             )
+
+    # ==========================================================================
+    # 空室時のボイスチャンネルステータス除去
+    # ==========================================================================
+
+    async def _restore_voice_status_cleanup_tasks(self) -> None:
+        """再起動後、設定済みカテゴリ内の空室 VC を再度監視する。"""
+        async with async_session() as session:
+            configs_by_guild = {
+                guild.id: await list_voice_status_cleanup_configs(
+                    session,
+                    str(guild.id),
+                )
+                for guild in self.bot.guilds
+            }
+
+        for guild in self.bot.guilds:
+            for config in configs_by_guild[guild.id]:
+                category = guild.get_channel(int(config.category_id))
+                if not isinstance(category, discord.CategoryChannel):
+                    continue
+                self._schedule_empty_voice_channels(
+                    category,
+                    config.delay_seconds,
+                    replace=False,
+                )
+
+    async def _handle_voice_status_cleanup_state_update(
+        self,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """入退室に合わせてステータス除去タスクを開始・中止する。"""
+        if isinstance(after.channel, discord.VoiceChannel):
+            self._cancel_voice_status_cleanup(after.channel.id)
+
+        before_channel = before.channel
+        if (
+            not isinstance(before_channel, discord.VoiceChannel)
+            or before_channel.members
+        ):
+            return
+
+        category_id = before_channel.category_id
+        if not isinstance(category_id, int):
+            return
+
+        async with async_session() as session:
+            config = await get_voice_status_cleanup_config(
+                session,
+                str(before_channel.guild.id),
+                str(category_id),
+            )
+        if config is None:
+            return
+
+        self._start_voice_status_cleanup(
+            before_channel,
+            category_id,
+            config.delay_seconds,
+            replace=False,
+        )
+
+    def _schedule_empty_voice_channels(
+        self,
+        category: discord.CategoryChannel,
+        delay_seconds: int,
+        *,
+        replace: bool,
+    ) -> None:
+        """カテゴリ内ですでに空室の VC に除去タスクを設定する。"""
+        for channel in category.voice_channels:
+            if channel.members:
+                continue
+            self._start_voice_status_cleanup(
+                channel,
+                category.id,
+                delay_seconds,
+                replace=replace,
+            )
+
+    def _start_voice_status_cleanup(
+        self,
+        channel: discord.VoiceChannel,
+        category_id: int,
+        delay_seconds: int,
+        *,
+        replace: bool,
+    ) -> None:
+        """指定 VC の遅延ステータス除去タスクを開始する。"""
+        existing = self._voice_status_cleanup_tasks.get(channel.id)
+        if existing is not None and not existing.task.done():
+            if not replace:
+                return
+            existing.task.cancel()
+
+        task = asyncio.create_task(
+            self._clear_voice_status_after_delay(
+                channel.guild.id,
+                channel.id,
+                category_id,
+                delay_seconds,
+            ),
+            name=f"voice-status-cleanup:{channel.guild.id}:{channel.id}",
+        )
+        self._voice_status_cleanup_tasks[channel.id] = _PendingVoiceStatusCleanup(
+            task=task,
+            guild_id=channel.guild.id,
+            category_id=category_id,
+        )
+
+    def _cancel_voice_status_cleanup(self, channel_id: int) -> None:
+        """指定 VC の実行待ちタスクを中止する。"""
+        pending = self._voice_status_cleanup_tasks.pop(channel_id, None)
+        if pending is not None:
+            pending.task.cancel()
+
+    def _cancel_voice_status_cleanup_for_category(self, category_id: int) -> None:
+        """指定カテゴリに属する実行待ちタスクを全て中止する。"""
+        channel_ids = [
+            channel_id
+            for channel_id, pending in self._voice_status_cleanup_tasks.items()
+            if pending.category_id == category_id
+        ]
+        for channel_id in channel_ids:
+            self._cancel_voice_status_cleanup(channel_id)
+
+    def _cancel_voice_status_cleanup_for_guild(self, guild_id: int) -> None:
+        """指定サーバーに属する実行待ちタスクを全て中止する。"""
+        channel_ids = [
+            channel_id
+            for channel_id, pending in self._voice_status_cleanup_tasks.items()
+            if pending.guild_id == guild_id
+        ]
+        for channel_id in channel_ids:
+            self._cancel_voice_status_cleanup(channel_id)
+
+    async def _clear_voice_status_after_delay(
+        self,
+        guild_id: int,
+        channel_id: int,
+        category_id: int,
+        delay_seconds: int,
+    ) -> None:
+        """待機後も同じカテゴリで空室なら VC ステータスを除去する。"""
+        try:
+            await asyncio.sleep(delay_seconds)
+
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                return
+            channel = guild.get_channel(channel_id)
+            if (
+                not isinstance(channel, discord.VoiceChannel)
+                or channel.category_id != category_id
+                or channel.members
+            ):
+                return
+
+            async with async_session() as session:
+                config = await get_voice_status_cleanup_config(
+                    session,
+                    str(guild_id),
+                    str(category_id),
+                )
+            if config is None or config.delay_seconds != delay_seconds:
+                return
+
+            bot_user = getattr(self.bot, "user", None)
+            bot_user_id = getattr(bot_user, "id", None)
+            if not _can_clear_voice_channel_status(
+                channel,
+                bot_user_id=bot_user_id if isinstance(bot_user_id, int) else None,
+            ):
+                logger.warning(
+                    "Cannot clear voice channel status due to missing permissions: "
+                    "guild=%s channel=%s",
+                    guild_id,
+                    channel_id,
+                )
+                return
+
+            await channel.edit(
+                status=None,
+                reason="空室になったボイスチャンネルのステータスを自動除去",
+            )
+        except (discord.Forbidden, discord.HTTPException) as error:
+            logger.warning(
+                "Failed to clear voice channel status: guild=%s channel=%s error=%s",
+                guild_id,
+                channel_id,
+                error,
+            )
+        except Exception:
+            logger.exception(
+                "Unexpected voice status cleanup failure: guild=%s channel=%s",
+                guild_id,
+                channel_id,
+            )
+        finally:
+            pending = self._voice_status_cleanup_tasks.get(channel_id)
+            if pending is not None and pending.task is asyncio.current_task():
+                self._voice_status_cleanup_tasks.pop(channel_id, None)
 
     # ==========================================================================
     # VC 入退室通知
@@ -2347,6 +2613,12 @@ class VoiceCog(commands.Cog):
         default_permissions=discord.Permissions(administrator=True),
         guild_only=True,
     )
+    voice_status_cleanup_group = app_commands.Group(
+        name="voice-status-cleanup",
+        description="空室VCのステータス自動除去を管理します",
+        default_permissions=discord.Permissions(administrator=True),
+        guild_only=True,
+    )
 
     @vc_group.command(name="lobby", description="ロビーVCを作成します")
     @app_commands.describe(dialog="連番共有ロビーをダイアログで設定します")
@@ -2500,7 +2772,7 @@ class VoiceCog(commands.Cog):
         self,
         interaction: discord.Interaction,
     ) -> bool:
-        """voice-notify コマンドがサーバー内で実行されたか確認する。"""
+        """VC 関連設定コマンドがサーバー内で実行されたか確認する。"""
         if interaction.guild is None or interaction.guild_id is None:
             await interaction.response.send_message(
                 "このコマンドはサーバー内でのみ実行できます。",
@@ -2508,6 +2780,113 @@ class VoiceCog(commands.Cog):
             )
             return False
         return True
+
+    @voice_status_cleanup_group.command(
+        name="add",
+        description="カテゴリ内の空室VCステータス自動除去を設定します",
+    )
+    @app_commands.describe(
+        category="監視するVCカテゴリ",
+        delay_minutes="0人になってから除去するまでの分数",
+    )
+    async def voice_status_cleanup_add(
+        self,
+        interaction: discord.Interaction,
+        category: discord.CategoryChannel,
+        delay_minutes: app_commands.Range[
+            int, 1, VOICE_STATUS_CLEANUP_MAX_DELAY_MINUTES
+        ] = VOICE_STATUS_CLEANUP_DEFAULT_DELAY_MINUTES,
+    ) -> None:
+        """カテゴリ別の空室時ステータス除去を追加または更新する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        delay_seconds = int(delay_minutes) * 60
+        async with async_session() as session:
+            await set_voice_status_cleanup_config(
+                session,
+                str(interaction.guild_id),
+                str(category.id),
+                delay_seconds,
+            )
+
+        self._cancel_voice_status_cleanup_for_category(category.id)
+        self._schedule_empty_voice_channels(
+            category,
+            delay_seconds,
+            replace=True,
+        )
+        await interaction.response.send_message(
+            "VCステータス自動除去を設定しました。\n"
+            f"対象カテゴリ: <#{category.id}>\n"
+            f"除去タイミング: 0人になってから{delay_minutes}分後",
+            ephemeral=True,
+        )
+
+    @voice_status_cleanup_group.command(
+        name="remove",
+        description="カテゴリの空室VCステータス自動除去を解除します",
+    )
+    async def voice_status_cleanup_remove(
+        self,
+        interaction: discord.Interaction,
+        category: discord.CategoryChannel,
+    ) -> None:
+        """カテゴリ別の空室時ステータス除去設定を解除する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            removed = await delete_voice_status_cleanup_config(
+                session,
+                str(interaction.guild_id),
+                str(category.id),
+            )
+
+        self._cancel_voice_status_cleanup_for_category(category.id)
+        content = (
+            f"VCステータス自動除去を解除しました。対象カテゴリ: <#{category.id}>"
+            if removed
+            else f"そのカテゴリには設定されていません。対象カテゴリ: <#{category.id}>"
+        )
+        await interaction.response.send_message(content, ephemeral=True)
+
+    @voice_status_cleanup_group.command(
+        name="status",
+        description="空室VCステータス自動除去の設定を表示します",
+    )
+    async def voice_status_cleanup_status(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        """サーバー内のカテゴリ別ステータス除去設定を表示する。"""
+        if not await self._ensure_voice_notify_guild(interaction):
+            return
+
+        async with async_session() as session:
+            configs = await list_voice_status_cleanup_configs(
+                session,
+                str(interaction.guild_id),
+            )
+
+        if not configs:
+            await interaction.response.send_message(
+                "VCステータス自動除去は設定されていません。",
+                ephemeral=True,
+            )
+            return
+
+        lines = _format_limited_voice_notify_lines(
+            [
+                f"・<#{config.category_id}> — "
+                f"{_format_voice_status_cleanup_delay(config.delay_seconds)}"
+                for config in configs
+            ]
+        )
+        await interaction.response.send_message(
+            "VCステータス自動除去の設定:\n" + "\n".join(lines),
+            ephemeral=True,
+        )
 
     @voice_notify_group.command(
         name="add",

@@ -11,6 +11,7 @@ from src.database.models import (
     VoiceNotifyCrossGuildConfig,
     VoiceNotifyCrossGuildExclude,
     VoiceNotifyExclude,
+    VoiceStatusCleanupConfig,
 )
 
 __all__ = [
@@ -463,6 +464,11 @@ async def delete_voice_notify_by_guild(
             VoiceNotifyCrossGuildConfig.guild_id == guild_id
         )
     )
+    status_cleanup_result = await session.execute(
+        delete(VoiceStatusCleanupConfig).where(
+            VoiceStatusCleanupConfig.guild_id == guild_id
+        )
+    )
     await session.commit()
     return (
         _rowcount(voice_result)
@@ -470,6 +476,7 @@ async def delete_voice_notify_by_guild(
         + _rowcount(exclude_result)
         + _rowcount(cross_exclude_result)
         + _rowcount(cross_result)
+        + _rowcount(status_cleanup_result)
     )
 
 
@@ -517,6 +524,12 @@ async def delete_voice_notify_by_channel(
         )
         .values(notify_channel_id=None)
     )
+    status_cleanup_result = await session.execute(
+        delete(VoiceStatusCleanupConfig).where(
+            VoiceStatusCleanupConfig.guild_id == guild_id,
+            VoiceStatusCleanupConfig.category_id == channel_id,
+        )
+    )
     await session.commit()
     return (
         _rowcount(voice_result)
@@ -524,4 +537,5 @@ async def delete_voice_notify_by_channel(
         + _rowcount(exclude_result)
         + _rowcount(cross_exclude_result)
         + _rowcount(cross_result)
+        + _rowcount(status_cleanup_result)
     )

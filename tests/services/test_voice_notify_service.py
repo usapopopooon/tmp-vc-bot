@@ -24,9 +24,12 @@ from src.services.db_service import (
     delete_voice_notify_cross_guild_config,
     delete_voice_notify_cross_guild_exclude,
     delete_voice_notify_exclude,
+    delete_voice_status_cleanup_by_guild,
+    delete_voice_status_cleanup_config,
     get_voice_notify_category_config,
     get_voice_notify_config,
     get_voice_notify_cross_guild_config,
+    get_voice_status_cleanup_config,
     is_voice_notify_cross_guild_excluded,
     is_voice_notify_excluded,
     list_voice_notify_category_configs,
@@ -35,11 +38,13 @@ from src.services.db_service import (
     list_voice_notify_cross_guild_excludes,
     list_voice_notify_cross_guild_receivers,
     list_voice_notify_excludes,
+    list_voice_status_cleanup_configs,
     set_voice_notify_category_config,
     set_voice_notify_config,
     set_voice_notify_cross_guild_channel,
     set_voice_notify_cross_guild_invite_url,
     set_voice_notify_cross_guild_share,
+    set_voice_status_cleanup_config,
 )
 
 if TYPE_CHECKING:
@@ -159,6 +164,66 @@ class TestVoiceNotifyCategoryOperations:
         assert (
             await delete_voice_notify_category_config(db_session, "123", "222") is False
         )
+
+
+class TestVoiceStatusCleanupOperations:
+    """カテゴリ別の空室時ステータス除去設定操作テスト。"""
+
+    async def test_set_get_update_and_list_config(
+        self,
+        db_session: AsyncSession,
+    ) -> None:
+        """カテゴリごとに待ち時間を作成・更新・一覧取得できる。"""
+        created = await set_voice_status_cleanup_config(
+            db_session,
+            "123",
+            "222",
+            300,
+        )
+        updated = await set_voice_status_cleanup_config(
+            db_session,
+            "123",
+            "222",
+            600,
+        )
+
+        assert updated.id == created.id
+        assert updated.delay_seconds == 600
+
+        found = await get_voice_status_cleanup_config(db_session, "123", "222")
+        assert found is not None
+        assert found.delay_seconds == 600
+
+        configs = await list_voice_status_cleanup_configs(db_session, "123")
+        assert [config.category_id for config in configs] == ["222"]
+
+    async def test_delete_config_and_guild_configs(
+        self,
+        db_session: AsyncSession,
+    ) -> None:
+        """カテゴリ単位とサーバー単位で設定を削除できる。"""
+        await set_voice_status_cleanup_config(db_session, "123", "222", 300)
+        await set_voice_status_cleanup_config(db_session, "123", "333", 600)
+        await set_voice_status_cleanup_config(db_session, "999", "444", 300)
+
+        assert (
+            await delete_voice_status_cleanup_config(db_session, "123", "222") is True
+        )
+        assert (
+            await delete_voice_status_cleanup_config(db_session, "123", "222") is False
+        )
+        assert await delete_voice_status_cleanup_by_guild(db_session, "123") == 1
+
+        other = await list_voice_status_cleanup_configs(db_session, "999")
+        assert [config.category_id for config in other] == ["444"]
+
+    async def test_rejects_delay_outside_supported_range(
+        self,
+        db_session: AsyncSession,
+    ) -> None:
+        """待ち時間は1分から24時間の範囲に制限する。"""
+        with pytest.raises(ValueError, match="between 60 and 86400"):
+            await set_voice_status_cleanup_config(db_session, "123", "222", 59)
 
 
 class TestVoiceNotifyExcludeOperations:
@@ -326,15 +391,17 @@ class TestVoiceNotifyCleanupOperations:
         await add_voice_notify_cross_guild_exclude(db_session, "123", "456")
         await set_voice_notify_cross_guild_share(db_session, "123", True)
         await set_voice_notify_cross_guild_channel(db_session, "123", "456")
+        await set_voice_status_cleanup_config(db_session, "123", "456", 300)
         await set_voice_notify_config(db_session, "999", "456", "999")
 
         deleted = await delete_voice_notify_by_channel(db_session, "123", "456")
 
-        assert deleted == 6
+        assert deleted == 7
         assert await list_voice_notify_configs(db_session, "123") == []
         assert await list_voice_notify_category_configs(db_session, "123") == []
         assert await list_voice_notify_excludes(db_session, "123") == []
         assert await list_voice_notify_cross_guild_excludes(db_session, "123") == []
+        assert await list_voice_status_cleanup_configs(db_session, "123") == []
         cross_config = await get_voice_notify_cross_guild_config(db_session, "123")
         assert cross_config is not None
         assert cross_config.share_enabled is True
@@ -350,13 +417,15 @@ class TestVoiceNotifyCleanupOperations:
         await set_voice_notify_category_config(db_session, "234", "222", "999")
         await set_voice_notify_cross_guild_channel(db_session, "234", "999")
         await add_voice_notify_cross_guild_exclude(db_session, "234", "777")
+        await set_voice_status_cleanup_config(db_session, "234", "222", 300)
         await add_voice_notify_exclude(db_session, "345", "777")
 
         deleted = await delete_voice_notify_by_guild(db_session, "234")
 
-        assert deleted == 3
+        assert deleted == 4
         assert await list_voice_notify_category_configs(db_session, "234") == []
         assert await get_voice_notify_cross_guild_config(db_session, "234") is None
         assert await list_voice_notify_cross_guild_excludes(db_session, "234") == []
+        assert await list_voice_status_cleanup_configs(db_session, "234") == []
         assert len(await list_voice_notify_configs(db_session, "123")) == 1
         assert len(await list_voice_notify_excludes(db_session, "345")) == 1

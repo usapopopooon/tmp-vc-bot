@@ -3,3 +3,4 @@
 from src.services.common_service import *  # noqa: F401,F403
 from src.services.lobby_service import *  # noqa: F401,F403
 from src.services.voice_notify_service import *  # noqa: F401,F403
+from src.services.voice_status_cleanup_service import *  # noqa: F401,F403
