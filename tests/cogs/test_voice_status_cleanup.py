@@ -30,11 +30,18 @@ def _make_voice_channel(
     channel_id: int = 100,
     category_id: int = 200,
     member_count: int = 0,
+    bot_count: int = 0,
 ) -> MagicMock:
     channel = MagicMock(spec=discord.VoiceChannel)
     channel.id = channel_id
     channel.category_id = category_id
-    channel.members = [MagicMock(spec=discord.Member) for _ in range(member_count)]
+    human_members = [MagicMock(spec=discord.Member) for _ in range(member_count)]
+    bot_members = [MagicMock(spec=discord.Member) for _ in range(bot_count)]
+    for member in human_members:
+        member.bot = False
+    for member in bot_members:
+        member.bot = True
+    channel.members = [*human_members, *bot_members]
     channel.edit = AsyncMock()
     channel.guild = MagicMock(spec=discord.Guild)
     channel.guild.id = 1000
@@ -99,7 +106,7 @@ class TestVoiceStatusCleanupStateUpdate:
     """VC人数の境界値と再入室キャンセルを検証する。"""
 
     @pytest.mark.parametrize("member_count", [0, 1, 2, 3, 5])
-    async def test_schedules_only_when_channel_reaches_zero_members(
+    async def test_schedules_only_when_channel_reaches_zero_human_members(
         self,
         member_count: int,
     ) -> None:
@@ -133,6 +140,34 @@ class TestVoiceStatusCleanupStateUpdate:
             get_config.assert_not_awaited()
             cog._start_voice_status_cleanup.assert_not_called()
 
+    @pytest.mark.parametrize("bot_count", [1, 2, 3, 5])
+    async def test_schedules_when_only_bots_remain(self, bot_count: int) -> None:
+        cog = _make_cog()
+        channel = _make_voice_channel(bot_count=bot_count)
+        before = _make_voice_state(channel)
+        after = _make_voice_state(None)
+        config = MagicMock(delay_seconds=300)
+        factory, session = _mock_async_session()
+        cog._start_voice_status_cleanup = MagicMock()  # type: ignore[method-assign]
+
+        with (
+            patch("src.cogs.voice.async_session", factory),
+            patch(
+                "src.cogs.voice.get_voice_status_cleanup_config",
+                new_callable=AsyncMock,
+                return_value=config,
+            ) as get_config,
+        ):
+            await cog._handle_voice_status_cleanup_state_update(before, after)
+
+        get_config.assert_awaited_once_with(session, "1000", "200")
+        cog._start_voice_status_cleanup.assert_called_once_with(
+            channel,
+            200,
+            300,
+            replace=False,
+        )
+
     async def test_join_cancels_pending_cleanup_without_db_lookup(self) -> None:
         cog = _make_cog()
         channel = _make_voice_channel(member_count=1)
@@ -147,6 +182,34 @@ class TestVoiceStatusCleanupStateUpdate:
             await cog._handle_voice_status_cleanup_state_update(before, after)
 
         cog._cancel_voice_status_cleanup.assert_called_once_with(channel.id)
+
+    async def test_bot_join_does_not_cancel_cleanup(self) -> None:
+        cog = _make_cog()
+        channel = _make_voice_channel(bot_count=1)
+        before = _make_voice_state(None)
+        after = _make_voice_state(channel)
+        config = MagicMock(delay_seconds=300)
+        factory, _ = _mock_async_session()
+        cog._cancel_voice_status_cleanup = MagicMock()  # type: ignore[method-assign]
+        cog._start_voice_status_cleanup = MagicMock()  # type: ignore[method-assign]
+
+        with (
+            patch("src.cogs.voice.async_session", factory),
+            patch(
+                "src.cogs.voice.get_voice_status_cleanup_config",
+                new_callable=AsyncMock,
+                return_value=config,
+            ),
+        ):
+            await cog._handle_voice_status_cleanup_state_update(before, after)
+
+        cog._cancel_voice_status_cleanup.assert_not_called()
+        cog._start_voice_status_cleanup.assert_called_once_with(
+            channel,
+            200,
+            300,
+            replace=False,
+        )
 
     async def test_listener_passes_before_and_after_to_cleanup_handler(self) -> None:
         """イベント入力を入れ替えずステータス監視へ渡す。"""
@@ -169,11 +232,13 @@ class TestVoiceStatusCleanupStateUpdate:
 class TestVoiceStatusCleanupExecution:
     """待機後の再確認と Discord API 呼び出しを検証する。"""
 
-    async def test_clears_status_after_delay_when_channel_is_still_empty(
+    @pytest.mark.parametrize("bot_count", [0, 1, 2, 3, 5])
+    async def test_clears_status_when_no_humans_remain(
         self,
+        bot_count: int,
     ) -> None:
         cog = _make_cog()
-        channel = _make_voice_channel()
+        channel = _make_voice_channel(bot_count=bot_count)
         _grant_voice_status_cleanup_permissions(channel)
         guild = channel.guild
         guild.get_channel.return_value = channel
@@ -307,6 +372,26 @@ class TestVoiceStatusCleanupLifecycle:
             replace=False,
         )
 
+    def test_existing_channel_scan_ignores_bots(self) -> None:
+        cog = _make_cog()
+        bots_only = _make_voice_channel(channel_id=100, bot_count=3)
+        has_human = _make_voice_channel(
+            channel_id=101,
+            member_count=1,
+            bot_count=3,
+        )
+        category = _make_category([bots_only, has_human])
+        cog._start_voice_status_cleanup = MagicMock()  # type: ignore[method-assign]
+
+        cog._schedule_empty_voice_channels(category, 300, replace=False)
+
+        cog._start_voice_status_cleanup.assert_called_once_with(
+            bots_only,
+            200,
+            300,
+            replace=False,
+        )
+
     async def test_category_delete_cancels_tasks_and_cleans_persistence(self) -> None:
         cog = _make_cog()
         category = _make_category()
@@ -370,7 +455,7 @@ class TestVoiceStatusCleanupCommands:
             replace=True,
         )
         message = interaction.response.send_message.call_args.args[0]
-        assert "0人になってから1分後" in message
+        assert "人間が0人になってから1分後" in message
 
     async def test_remove_deletes_config_and_cancels_category_tasks(self) -> None:
         cog = _make_cog()

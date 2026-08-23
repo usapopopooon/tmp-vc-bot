@@ -591,6 +591,11 @@ def _format_voice_status_cleanup_delay(delay_seconds: int) -> str:
     return f"{delay_seconds // 60}分"
 
 
+def _has_human_voice_members(channel: discord.VoiceChannel) -> bool:
+    """VC に Bot ではないメンバーがいるか判定する。"""
+    return any(not member.bot for member in channel.members)
+
+
 def _can_clear_voice_channel_status(
     channel: discord.VoiceChannel,
     *,
@@ -984,31 +989,45 @@ class VoiceCog(commands.Cog):
         after: discord.VoiceState,
     ) -> None:
         """入退室に合わせてステータス除去タスクを開始・中止する。"""
-        if isinstance(after.channel, discord.VoiceChannel):
-            self._cancel_voice_status_cleanup(after.channel.id)
+        channels_without_humans: list[discord.VoiceChannel] = []
+        after_channel = after.channel
+        if isinstance(after_channel, discord.VoiceChannel):
+            if _has_human_voice_members(after_channel):
+                self._cancel_voice_status_cleanup(after_channel.id)
+            else:
+                channels_without_humans.append(after_channel)
 
         before_channel = before.channel
         if (
-            not isinstance(before_channel, discord.VoiceChannel)
-            or before_channel.members
+            isinstance(before_channel, discord.VoiceChannel)
+            and before_channel != after_channel
+            and not _has_human_voice_members(before_channel)
         ):
-            return
+            channels_without_humans.append(before_channel)
 
-        category_id = before_channel.category_id
+        for channel in channels_without_humans:
+            await self._schedule_voice_status_cleanup_if_configured(channel)
+
+    async def _schedule_voice_status_cleanup_if_configured(
+        self,
+        channel: discord.VoiceChannel,
+    ) -> None:
+        """人間がいない VC にカテゴリ設定済みなら除去タスクを開始する。"""
+        category_id = channel.category_id
         if not isinstance(category_id, int):
             return
 
         async with async_session() as session:
             config = await get_voice_status_cleanup_config(
                 session,
-                str(before_channel.guild.id),
+                str(channel.guild.id),
                 str(category_id),
             )
         if config is None:
             return
 
         self._start_voice_status_cleanup(
-            before_channel,
+            channel,
             category_id,
             config.delay_seconds,
             replace=False,
@@ -1023,7 +1042,7 @@ class VoiceCog(commands.Cog):
     ) -> None:
         """カテゴリ内ですでに空室の VC に除去タスクを設定する。"""
         for channel in category.voice_channels:
-            if channel.members:
+            if _has_human_voice_members(channel):
                 continue
             self._start_voice_status_cleanup(
                 channel,
@@ -1106,7 +1125,7 @@ class VoiceCog(commands.Cog):
             if (
                 not isinstance(channel, discord.VoiceChannel)
                 or channel.category_id != category_id
-                or channel.members
+                or _has_human_voice_members(channel)
             ):
                 return
 
@@ -2787,7 +2806,7 @@ class VoiceCog(commands.Cog):
     )
     @app_commands.describe(
         category="監視するVCカテゴリ",
-        delay_minutes="0人になってから除去するまでの分数",
+        delay_minutes="人間が0人になってから除去するまでの分数",
     )
     async def voice_status_cleanup_add(
         self,
@@ -2819,7 +2838,7 @@ class VoiceCog(commands.Cog):
         await interaction.response.send_message(
             "VCステータス自動除去を設定しました。\n"
             f"対象カテゴリ: <#{category.id}>\n"
-            f"除去タイミング: 0人になってから{delay_minutes}分後",
+            f"除去タイミング: 人間が0人になってから{delay_minutes}分後",
             ephemeral=True,
         )
 
