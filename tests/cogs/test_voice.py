@@ -110,6 +110,7 @@ def _make_voice_session(
     vs.name = "Test channel"
     vs.is_locked = is_locked
     vs.is_hidden = is_hidden
+    vs.hidden_view_overwrites = None
     return vs
 
 
@@ -1041,6 +1042,39 @@ class TestHandleChannelLeave:
         ):
             await cog._handle_channel_leave(leaver, channel)
             mock_update.assert_not_awaited()
+
+    async def test_hidden_channel_revokes_leaver_view_permission(self) -> None:
+        """非表示 VC の退出者は、退出後にチャンネルを見られない。"""
+        cog = _make_cog()
+        owner = _make_member(1)
+        leaver = _make_member(2)
+        channel = _make_channel(100, [owner])
+        channel.guild.default_role = MagicMock(spec=discord.Role)
+        channel.guild.default_role.id = 1000
+        channel.set_permissions = AsyncMock()
+        leaver_overwrite = discord.PermissionOverwrite(view_channel=True)
+        channel.overwrites_for = MagicMock(return_value=leaver_overwrite)
+        voice_session = _make_voice_session(
+            channel_id="100",
+            owner_id="1",
+            is_hidden=True,
+        )
+
+        mock_factory, mock_session = _mock_async_session()
+        with (
+            patch("src.cogs.voice.async_session", mock_factory),
+            patch(
+                "src.cogs.voice.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+        ):
+            await cog._handle_channel_leave(leaver, channel)
+
+        call = _permission_call_for(channel.set_permissions, leaver)
+        assert call.kwargs["overwrite"].view_channel is False
+        assert voice_session.hidden_view_overwrites["member:2"] is None
+        mock_session.commit.assert_awaited_once()
 
 
 # ===========================================================================

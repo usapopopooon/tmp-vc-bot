@@ -57,6 +57,10 @@ from src.services.db_service import (
     get_voice_session,
     update_voice_session,
 )
+from src.services.voice_visibility_service import (
+    hide_voice_channel,
+    show_voice_channel,
+)
 from src.utils import get_resource_lock
 
 logger = logging.getLogger(__name__)
@@ -1654,8 +1658,8 @@ class ControlPanelView(discord.ui.View):
     ) -> None:
         """非表示/表示トグルボタン。
 
-        非表示時: @everyone の view_channel を拒否、現在のメンバーには許可
-        表示時: @everyone の view_channel 上書きを削除
+        非表示時: 在室メンバーと Bot だけ view_channel を許可
+        表示時: 非表示前の view_channel 上書きを復元
         """
         channel = interaction.channel
         if not isinstance(channel, discord.VoiceChannel) or not interaction.guild:
@@ -1677,23 +1681,11 @@ class ControlPanelView(discord.ui.View):
                 new_hidden_state = not voice_session.is_hidden
 
                 if new_hidden_state:
-                    # 非表示: @everyone のチャンネル表示を拒否
-                    await _update_permission_overwrite(
-                        channel, interaction.guild.default_role, view_channel=False
-                    )
-                    # 現在チャンネルにいるメンバーには表示を許可
-                    for member in channel.members:
-                        await _update_permission_overwrite(
-                            channel, member, view_channel=True
-                        )
+                    await hide_voice_channel(channel, voice_session)
                     button.label = "表示"
                     button.emoji = "👁️"
                 else:
-                    # 表示: view_channel の上書きを削除
-                    # view_channel=None で「上書きなし」にする (ロールの設定に従う)
-                    await _update_permission_overwrite(
-                        channel, interaction.guild.default_role, view_channel=None
-                    )
+                    await show_voice_channel(channel, voice_session)
                     button.label = "非表示"
                     button.emoji = "🙈"
 

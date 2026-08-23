@@ -83,6 +83,7 @@ def _make_voice_session(
     vs.name = name
     vs.is_locked = is_locked
     vs.is_hidden = is_hidden
+    vs.hidden_view_overwrites = None
     return vs
 
 
@@ -132,7 +133,10 @@ def _make_interaction(
         interaction.channel = MagicMock(spec=discord.TextChannel)
 
     interaction.guild = MagicMock(spec=discord.Guild)
-    interaction.guild.default_role = MagicMock()
+    interaction.guild.default_role = MagicMock(spec=discord.Role)
+    interaction.guild.default_role.id = 1000
+    if is_voice:
+        interaction.channel.guild = interaction.guild
 
     interaction.response = AsyncMock()
     interaction.followup = AsyncMock()
@@ -931,6 +935,189 @@ class TestHideButton:
             interaction.channel.send.assert_awaited_once()
             msg = interaction.channel.send.call_args[0][0]
             assert "表示" in msg
+
+    async def test_hide_denies_role_view_permission(self) -> None:
+        """ロールの view_channel=True でも部外者から見えないようにする。"""
+        view = ControlPanelView(session_id=1)
+        interaction = _make_interaction(user_id=1)
+        role = MagicMock(spec=discord.Role)
+        role.id = 200
+        role_overwrite = discord.PermissionOverwrite(view_channel=True)
+        interaction.channel.overwrites = {role: role_overwrite}
+        interaction.channel.overwrites_for = MagicMock(
+            side_effect=lambda target: (
+                role_overwrite if target is role else discord.PermissionOverwrite()
+            )
+        )
+        voice_session = _make_voice_session(owner_id="1", is_hidden=False)
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+            patch(
+                "src.ui.control_panel.update_voice_session",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await view.hide_button.callback(interaction)
+
+        _assert_permission_field(
+            interaction.channel.set_permissions,
+            role,
+            "view_channel",
+            False,
+        )
+        assert voice_session.hidden_view_overwrites["role:200"] is True
+
+    async def test_hide_denies_outside_member_view_permission(self) -> None:
+        """過去の個別許可が残るメンバーも、退出中なら非表示にする。"""
+        view = ControlPanelView(session_id=1)
+        interaction = _make_interaction(user_id=1)
+        outside_member = MagicMock(spec=discord.Member)
+        outside_member.id = 300
+        outside_member.bot = False
+        member_overwrite = discord.PermissionOverwrite(view_channel=True)
+        interaction.channel.overwrites = {outside_member: member_overwrite}
+        interaction.channel.overwrites_for = MagicMock(
+            side_effect=lambda target: (
+                member_overwrite
+                if target is outside_member
+                else discord.PermissionOverwrite()
+            )
+        )
+        voice_session = _make_voice_session(owner_id="1", is_hidden=False)
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+            patch(
+                "src.ui.control_panel.update_voice_session",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await view.hide_button.callback(interaction)
+
+        _assert_permission_field(
+            interaction.channel.set_permissions,
+            outside_member,
+            "view_channel",
+            False,
+        )
+        assert voice_session.hidden_view_overwrites["member:300"] is True
+
+    async def test_hide_keeps_bot_access(self) -> None:
+        """非表示中も Bot 自身はパネルとチャンネルを操作できる。"""
+        view = ControlPanelView(session_id=1)
+        interaction = _make_interaction(user_id=1)
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.id = 999
+        bot_member.bot = True
+        other_bot = MagicMock(spec=discord.Member)
+        other_bot.id = 998
+        other_bot.bot = True
+        interaction.guild.me = bot_member
+        bot_overwrite = discord.PermissionOverwrite(send_messages=True)
+        other_bot_overwrite = discord.PermissionOverwrite(view_channel=True)
+        interaction.channel.overwrites = {other_bot: other_bot_overwrite}
+        interaction.channel.overwrites_for = MagicMock(
+            side_effect=lambda target: (
+                bot_overwrite
+                if target is bot_member
+                else (
+                    other_bot_overwrite
+                    if target is other_bot
+                    else discord.PermissionOverwrite()
+                )
+            )
+        )
+        voice_session = _make_voice_session(owner_id="1", is_hidden=False)
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+            patch(
+                "src.ui.control_panel.update_voice_session",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await view.hide_button.callback(interaction)
+
+        call = _permission_call_for(interaction.channel.set_permissions, bot_member)
+        overwrite = call.kwargs["overwrite"]
+        assert overwrite.view_channel is True
+        assert overwrite.send_messages is True
+        assert all(
+            permission_call.args[0] is not other_bot
+            for permission_call in interaction.channel.set_permissions.await_args_list
+        )
+
+    async def test_show_restores_original_role_view_permission(self) -> None:
+        """表示へ戻すと、非表示前のロール権限を正確に復元する。"""
+        view = ControlPanelView(session_id=1, is_hidden=True)
+        interaction = _make_interaction(user_id=1)
+        role = MagicMock(spec=discord.Role)
+        role.id = 200
+        default_overwrite = discord.PermissionOverwrite(view_channel=False)
+        role_overwrite = discord.PermissionOverwrite(
+            view_channel=False,
+            connect=True,
+        )
+        interaction.channel.overwrites = {
+            interaction.guild.default_role: default_overwrite,
+            role: role_overwrite,
+        }
+        interaction.channel.overwrites_for = MagicMock(
+            side_effect=lambda target: (
+                role_overwrite if target is role else default_overwrite
+            )
+        )
+        interaction.guild.get_role = MagicMock(
+            side_effect=lambda role_id: role if role_id == 200 else None
+        )
+        voice_session = _make_voice_session(owner_id="1", is_hidden=True)
+        voice_session.hidden_view_overwrites = {
+            "role:1000": None,
+            "role:200": True,
+        }
+
+        mock_factory, _ = _mock_async_session()
+        with (
+            patch("src.ui.control_panel.async_session", mock_factory),
+            patch(
+                "src.ui.control_panel.get_voice_session",
+                new_callable=AsyncMock,
+                return_value=voice_session,
+            ),
+            patch(
+                "src.ui.control_panel.update_voice_session",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await view.hide_button.callback(interaction)
+
+        role_call = _permission_call_for(
+            interaction.channel.set_permissions,
+            role,
+        )
+        restored = role_call.kwargs["overwrite"]
+        assert restored.view_channel is True
+        assert restored.connect is True
+        assert voice_session.hidden_view_overwrites is None
 
 
 # ===========================================================================

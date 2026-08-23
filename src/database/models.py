@@ -13,6 +13,7 @@
 from datetime import UTC, datetime
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -138,6 +139,9 @@ class VoiceSession(Base):
     sequence_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_locked: Mapped[bool] = mapped_column(Boolean, default=False)
     is_hidden: Mapped[bool] = mapped_column(Boolean, default=False)
+    hidden_view_overwrites: Mapped[dict[str, bool | None] | None] = mapped_column(
+        JSON, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )

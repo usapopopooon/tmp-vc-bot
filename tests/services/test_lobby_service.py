@@ -264,6 +264,41 @@ class TestVoiceSessionOperations:
         assert updated.is_hidden is True
         assert updated.owner_id == "222"
 
+    async def test_persists_hidden_view_overwrite_snapshot(
+        self, db_session: AsyncSession
+    ) -> None:
+        """非表示前の権限値を表示へ戻すまで永続化できる。"""
+        lobby = await create_lobby(
+            db_session,
+            guild_id="123",
+            lobby_channel_id="456",
+        )
+        voice_session = await create_voice_session(
+            db_session,
+            lobby_id=lobby.id,
+            channel_id="789",
+            owner_id="111",
+            name="Test Channel",
+        )
+        voice_session.hidden_view_overwrites = {
+            "role:123": True,
+            "member:222": None,
+        }
+
+        await update_voice_session(
+            db_session,
+            voice_session,
+            is_hidden=True,
+        )
+        db_session.expunge_all()
+        restored = await get_voice_session(db_session, "789")
+
+        assert restored is not None
+        assert restored.hidden_view_overwrites == {
+            "role:123": True,
+            "member:222": None,
+        }
+
     async def test_update_voice_session_name_only(
         self, db_session: AsyncSession
     ) -> None:
@@ -341,6 +376,7 @@ class TestVoiceSessionOperations:
 
         assert session.is_locked is False
         assert session.is_hidden is False
+        assert session.hidden_view_overwrites is None
 
 
 class TestVoiceSessionMemberOperations:

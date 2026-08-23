@@ -22,6 +22,7 @@ from discord.ext import commands
 
 from src.database.engine import async_session
 from src.services.db_service import get_all_voice_sessions
+from src.services.voice_visibility_service import hide_voice_channel
 from src.ui.control_panel import ControlPanelView
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,26 @@ class EphemeralVCBot(commands.Bot):
             )
         except discord.HTTPException as e:
             logger.warning("Failed to change_presence in on_ready: %s", e)
+
+        # 更新前から非表示だった VC にも、ロール・退出者を含む現在の
+        # 権限ルールを再適用する。再接続時は差分がなければ API を呼ばない。
+        async with async_session() as session:
+            sessions = await get_all_voice_sessions(session)
+            for voice_session in sessions:
+                if not voice_session.is_hidden:
+                    continue
+                channel = self.get_channel(int(voice_session.channel_id))
+                if not isinstance(channel, discord.VoiceChannel):
+                    continue
+                try:
+                    await hide_voice_channel(channel, voice_session)
+                    await session.commit()
+                except discord.HTTPException as e:
+                    logger.warning(
+                        "Failed to reconcile hidden channel %s: %s",
+                        channel.id,
+                        e,
+                    )
 
         if self.user:
             print(f"Logged in as {self.user} (ID: {self.user.id})")

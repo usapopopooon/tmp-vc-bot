@@ -99,6 +99,7 @@ from src.services.db_service import (
     set_voice_status_cleanup_config,
     update_voice_session,
 )
+from src.services.voice_visibility_service import set_hidden_member_visibility
 from src.ui.control_panel import (
     ControlPanelView,
     create_control_panel_embed,
@@ -1846,9 +1847,10 @@ class VoiceCog(commands.Cog):
 
             reason = self._evaluate_member_restriction(member, channel, voice_session)
             if not reason:
-                # 制限違反なし。隠しチャンネルなら閲覧権限を付与しておく
-                # (Bug D: 退出後も非表示のままにならないようにする)。
-                await self._grant_view_if_hidden(member, channel, voice_session)
+                # 制限違反なし。隠しチャンネルなら在室中だけ閲覧を許可する。
+                await self._grant_view_if_hidden(
+                    member, channel, voice_session, session
+                )
                 return False
 
             # 重複排除テーブルで重複防止 (マルチインスタンス)
@@ -1870,20 +1872,22 @@ class VoiceCog(commands.Cog):
         member: discord.Member,
         channel: discord.VoiceChannel,
         voice_session: VoiceSession,
+        session: AsyncSession,
     ) -> None:
         """非表示チャンネルに参加したメンバーに閲覧権限を付与する。
 
-        非表示モード時、参加したメンバーは VC 中はチャンネルが見える状態だが、
-        個別 overwrite が無いと退出後に再度見えなくなる。在室中・以降の
-        UX 一貫性のため、入室時に view_channel=True を設定する。
+        元の個別権限を保存し、在室中だけ view_channel=True を設定する。
         """
         if not voice_session.is_hidden:
             return
-        overwrites = channel.overwrites_for(member)
-        if overwrites.view_channel is True:
-            return
         try:
-            await _update_permission_overwrite(channel, member, view_channel=True)
+            await set_hidden_member_visibility(
+                channel,
+                voice_session,
+                member,
+                visible=True,
+            )
+            await session.commit()
         except discord.HTTPException as e:
             logger.warning(
                 "Failed to grant view_channel to %s on hidden channel %s: %s",
@@ -2296,6 +2300,25 @@ class VoiceCog(commands.Cog):
                 # DB からセッション記録を削除
                 await delete_voice_session(session, str(channel.id))
                 return
+
+            # 非表示 VC を退出したメンバーの個別許可を拒否へ戻す。
+            if voice_session.is_hidden:
+                try:
+                    await set_hidden_member_visibility(
+                        channel,
+                        voice_session,
+                        member,
+                        visible=False,
+                    )
+                    await session.commit()
+                except discord.HTTPException as e:
+                    logger.warning(
+                        "Failed to revoke view_channel from %s on hidden "
+                        "channel %s: %s",
+                        member.id,
+                        channel.id,
+                        e,
+                    )
 
             # --- オーナー退出 → 引き継ぎ ---
             if voice_session.owner_id == str(member.id):
